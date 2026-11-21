@@ -123,12 +123,20 @@ const lines = baseFull.split('\n');
 const targetText = lines.find(l => l.startsWith('+ It') || (l.length > 12 && !l.startsWith('#'))) || lines[5];
 const targetLine = lines.indexOf(targetText) + 1;
 
-// S2 dry-run must not write
-const s2a = await call('replace-lines', { 'base-rev': st.rev, 'base-hash': st.hash,
-  edits: [{ line: targetLine, old: targetText, new: targetText + ' [dry]' }], 'dry-run?': true });
+// S2 dry-run must not write, under the canonical key and both legacy aliases.
+const dryArgs = { 'base-rev': st.rev, 'base-hash': st.hash,
+  edits: [{ line: targetLine, old: targetText, new: targetText + ' [dry]' }] };
+const s2a = await call('replace-lines', { ...dryArgs, dryRun: true });
+const s2alias = await call('replace-lines', { ...dryArgs, 'dry-run': true });
+const s2legacy = await call('replace-lines', { ...dryArgs, 'dry-run?': true });
 const s2b = await call('get-status');
 check('S2 dry-run never writes', () => {
-  assert(s2a['dry-run'] === true, 'no dry-run flag');
+  for (const [name, r] of [['dryRun', s2a], ['dry-run', s2alias], ['dry-run?', s2legacy]]) {
+    assert(r['dry-run'] === true, `no dry-run flag for ${name}`);
+    assert(r.written === false, `dry-run claims a write for ${name}`);
+    assert(r['new-rev'] === undefined, `dry-run leaked new-rev for ${name}`);
+    assert(r.status === 'dry-run', `wrong dry-run status for ${name}: ${r.status}`);
+  }
   assert(String(s2a.preview).includes(String(targetLine)), 'preview not localized');
   assert(s2b.rev === st.rev && s2b.hash === st.hash, 'dry-run changed state');
 });
@@ -183,7 +191,7 @@ const secContent = sec.content;
 const rewrite = `${sec.content.trim()}\n\n+ Rehearsal rewrite line.\n`;
 console.error('  rev before S5:', st.rev);
 const dry5 = await call('apply-ops', { 'base-rev': st.rev, 'base-hash': st.hash,
-  heading: secName, 'new-section-text': rewrite, 'dry-run?': true });
+  heading: secName, 'new-section-text': rewrite, dryRun: true });
 st = await call('get-status');
 const w5 = await write('apply-ops', st => ({ 'base-rev': st.rev, 'base-hash': st.hash,
   heading: secName, 'new-section-text': rewrite }), c => c.includes('Rehearsal rewrite line.'));
@@ -193,7 +201,8 @@ const r5 = await write('apply-ops', st => ({ 'base-rev': st.rev, 'base-hash': st
   heading: secName, 'new-section-text': secContent }), c => norm(c) === norm(baseFull));
 const back5 = await call('read-section', { heading: secName });
 check('S5 section rewrite + restore', () => {
-  assert(dry5['dry-run'] === true, 'no dry-run flag');
+  assert(dry5['dry-run'] === true && dry5.written === false, 'bad dry-run flag/state');
+  assert(dry5['new-rev'] === undefined, 'dry-run leaked new-rev');
   assert(['download-poll', 'ack'].includes(w5.verified), 'rewrite not verified: ' + JSON.stringify(w5));
   assert(after5.content.includes('Rehearsal rewrite line.'), 'rewrite not visible');
   assert(norm(back5.content) === norm(secContent), 'section not restored');
@@ -252,6 +261,7 @@ for (let tries = 0; tries < 5 && (!found9.matches || found9.matches.length === 0
   await new Promise(r => setTimeout(r, 300));
   found9 = await call('search', { query: 'scenario insert line' });
 }
+const re9 = await call('search', { query: 'scenario\\s+insert\\s+line', regex: true, caseSensitive: true });
 const st9 = await call('get-status');
 const del9 = found9.matches && found9.matches.length
   ? await write('delete-lines',
@@ -262,6 +272,7 @@ const gone9 = await call('search', { query: 'scenario insert line' });
 check('S9 insert/search/delete', () => {
   assert(['download-poll', 'ack'].includes(ins9.verified), 'insert not verified');
   assert(found9.matches && found9.matches.length === 1, 'search did not find inserted line');
+  assert(re9.matches && re9.matches.length === 1, 'canonical regex/caseSensitive search failed');
   assert(['download-poll', 'ack'].includes(del9.verified), 'delete not verified');
   assert(gone9.matches.length === 0, 'insert line survived delete');
 });

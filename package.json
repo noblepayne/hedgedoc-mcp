@@ -15,7 +15,7 @@
     "prepack": "npm run build"
   },
   "type": "module",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "devDependencies": {
     "fast-check": "^4.10.2"
   },

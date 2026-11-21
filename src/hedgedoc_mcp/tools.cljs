@@ -238,7 +238,7 @@
 
 (defn- wait-for-rev!
   "Resolve true once state advances past pre-rev, else false at deadline.
-   Lets :verify? false return quickly without leaving local state stale."
+   Lets :verify false return quickly without leaving local state stale."
   [state pre-rev deadline now-ms sleep-ms]
   (if (> (:rev @state) pre-rev)
     (js/Promise.resolve true)
@@ -300,16 +300,20 @@
            new-content (ops/apply-ops (:content snap) (:ops resolved))]
        (when dry-run?
          (throw (ex-info "dry-run preview"
-                         {:code :dry-run-preview
-                          :dry-run true
-                          :new-rev (inc (:rev snap))
-                          :new-hash (m/content-hash new-content)
-                          :preview (:text (preview-window new-content
-                                                          (:target-start resolved) 6))
-                          :preview-lines (select-keys (preview-window new-content
-                                                                      (:target-start resolved) 6)
-                                                      [:start-line :end-line])
-                          :ops (:ops resolved)})))
+                          {:code :dry-run-preview
+                           :dry-run true
+                           :status :dry-run
+                           :written false
+                           :base-rev (:rev snap)
+                           :base-hash (:hash snap)
+                           :would-be-hash (m/content-hash new-content)
+                           :preview (:text (preview-window new-content
+                                                                           (:target-start resolved) 6))
+                           :preview-lines (select-keys (preview-window new-content
+                                                                                       (:target-start resolved) 6)
+                                                                       [:start-line :end-line])
+                           :ops (:ops resolved)
+                           :hint "no write was emitted; rev and hash are the current base"})))
        (ops/overlap-check (get-presence) (:target-start resolved) (:target-end resolved) (:rev snap))
        (let [fresh @state]
          (when (not= (:rev fresh) (:rev snap))
@@ -416,9 +420,9 @@
 ;; ---------- 3. apply-ops ----------
 
 (defn apply-ops
-  "{:base-rev :base-hash :ops|:new-section-text :heading? :occurrence? :dry-run?}
+  "{:base-rev :base-hash :ops|:new-section-text :heading? :occurrence? :dryRun}
    Dry-run returns {:dry-run true :new-rev :new-hash :preview :ops}."
-  [{:keys [connected?] :as env} {:keys [base-rev base-hash dry-run?] :as args}]
+  [{:keys [connected?] :as env} {:keys [base-rev base-hash dryRun] :as args}]
   (when (or (not (integer? base-rev)) (not (string? base-hash)))
     (throw (err :bad-args {:fields [:base-rev :base-hash] :got args})))
   (write-auth-check! env)
@@ -426,14 +430,14 @@
     (throw (err :not-connected {})))
   (let [op-id (str (random-uuid))]
     (emit-with-cas! env args {:op-id op-id :base-rev base-rev
-                              :base-hash base-hash :dry-run? (boolean dry-run?)})))
+                              :base-hash base-hash :dry-run? (boolean dryRun)})))
 
 ;; ---------- 4. append-to-section ----------
 
 (defn append-to-section
-  "{:heading :base-rev :base-hash :text :occurrence? :dry-run? :verify?}"
+  "{:heading :base-rev :base-hash :text :occurrence? :dryRun :verify}"
   [{:keys [connected?] :as env} {:keys [heading base-rev base-hash text occurrence
-                                        dry-run? verify?]}]
+                                        dryRun verify]}]
   (when (or (not (string? heading)) (str/blank? heading))
     (throw (err :bad-args {:field :heading :got heading})))
   (when (not (string? text))
@@ -449,17 +453,17 @@
           computed (ops/append-to-section-ops
                     (:content snap) sections heading text {:occurrence occurrence})]
       (emit-with-cas! env
-                      {:ops computed :verify? verify?}
+                      {:ops computed :verify? verify}
                       {:op-id (str (random-uuid))
                        :base-rev base-rev :base-hash base-hash
-                       :dry-run? (boolean dry-run?)}))))
+                       :dry-run? (boolean dryRun)}))))
 
 ;; ---------- 4b. replace-lines ----------
 
 (defn replace-lines
-  "{:base-rev :base-hash :edits [{:line :old :new}] :dry-run? :verify?}
+  "{:base-rev :base-hash :edits [{:line :old :new}] :dryRun :verify}
    1-based lines, exact :old match, single-line :new, batch applied bottom-up."
-  [{:keys [connected?] :as env} {:keys [base-rev base-hash edits dry-run? verify?]}]
+  [{:keys [connected?] :as env} {:keys [base-rev base-hash edits dryRun verify]}]
   (when (or (not (integer? base-rev)) (not (string? base-hash)))
     (throw (err :bad-args {:fields [:base-rev :base-hash]})))
   (when (or (not (sequential? edits)) (empty? edits))
@@ -473,14 +477,14 @@
           (ops/replace-lines->ops (:content snap) edits)]
     (emit-with-cas! env
                     {:ops ops :target-range [target-start target-end]
-                     :verify? verify?}
+                     :verify? verify}
                       {:op-id (str (random-uuid))
                        :base-rev base-rev :base-hash base-hash
-                       :dry-run? (boolean dry-run?)}))))
+                       :dry-run? (boolean dryRun)}))))
 
 (defn insert-lines
-  "{:base-rev :base-hash :line :text :dry-run? :verify?} insert before line."
-  [{:keys [connected?] :as env} {:keys [base-rev base-hash line text dry-run? verify?]}]
+  "{:base-rev :base-hash :line :text :dryRun :verify} insert before line."
+  [{:keys [connected?] :as env} {:keys [base-rev base-hash line text dryRun verify]}]
   (when (or (not (integer? base-rev)) (not (string? base-hash)))
     (throw (err :bad-args {:fields [:base-rev :base-hash]})))
   (write-auth-check! env)
@@ -492,14 +496,14 @@
           (ops/insert-lines->ops (:content snap) line text)]
       (emit-with-cas! env
                       {:ops ops :target-range [target-start target-end]
-                       :verify? verify?}
+                       :verify? verify}
                       {:op-id (str (random-uuid))
                        :base-rev base-rev :base-hash base-hash
-                       :dry-run? (boolean dry-run?)}))))
+                       :dry-run? (boolean dryRun)}))))
 
 (defn delete-lines
-  "{:base-rev :base-hash :line :count? :dry-run? :verify?} delete lines."
-  [{:keys [connected?] :as env} {:keys [base-rev base-hash line count dry-run? verify?]}]
+  "{:base-rev :base-hash :line :count? :dryRun :verify} delete lines."
+  [{:keys [connected?] :as env} {:keys [base-rev base-hash line count dryRun verify]}]
   (when (or (not (integer? base-rev)) (not (string? base-hash)))
     (throw (err :bad-args {:fields [:base-rev :base-hash]})))
   (write-auth-check! env)
@@ -511,14 +515,14 @@
           (ops/delete-lines->ops (:content snap) line (or count 1))]
       (emit-with-cas! env
                       {:ops ops :target-range [target-start target-end]
-                       :verify? verify?}
+                       :verify? verify}
                       {:op-id (str (random-uuid))
                        :base-rev base-rev :base-hash base-hash
-                       :dry-run? (boolean dry-run?)}))))
+                       :dry-run? (boolean dryRun)}))))
 
 (defn search
-  "{:query :regex? :case-sensitive? :limit?} -> matching lines with numbers."
-  [{:keys [state]} {:keys [query regex? case-sensitive? limit]}]
+  "{:query :regex :caseSensitive :limit?} -> matching lines with numbers."
+  [{:keys [state]} {:keys [query regex caseSensitive limit]}]
   (when (or (not (string? query)) (str/blank? query))
     (throw (err :bad-args {:field :query :got query})))
   (when (> (m/utf16-length query) 200)
@@ -528,12 +532,12 @@
   (let [v @state
         lines (vec (str/split-lines (:content v)))
         lim (min (or limit 50) 500)
-        cs? (boolean case-sensitive?)
-        re (when regex?
+        cs? (boolean caseSensitive)
+        re (when regex
              (try (js/RegExp. query (if cs? "" "i"))
                   (catch :default _e
                     (throw (err :bad-args {:field :query :reason :bad-regex})))))
-        hit? (if regex?
+        hit? (if regex
                (fn [line] (.test re line))
                (fn [line]
                  (if cs?

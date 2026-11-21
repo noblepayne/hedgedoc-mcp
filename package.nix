@@ -11,7 +11,7 @@ buildNpmPackage {
   src = ./.;
 
   # Refresh with: nix run nixpkgs#prefetch-npm-deps -- package-lock.json
-  npmDepsHash = "sha256-qCCeXOry5Jfz4tf7Gs6NdgFThpN1RRoQn+Mx4WLUjdI=";
+  npmDepsHash = "sha256-lIm+bcqmISZxbDjVvPhSsb7G28wR44Xi/eMzbHHqqXA=";
 
   nativeBuildInputs = [nodejs makeWrapper];
 
@@ -35,6 +35,7 @@ buildNpmPackage {
     node test/retry-safety.mjs
     node test/remote-op-fold.mjs
     node test/bin-launch.mjs
+    node test/arg-validation.mjs
     runHook postCheck
   '';
 

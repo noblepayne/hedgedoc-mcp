@@ -17,7 +17,7 @@ HedgeDoc project.
 - **Every write reports its evidence.** The adapter emits one op, then confirms
   the edited region through `/download`. `verified` is `download-poll` on
   success; a timeout is `status: applied-but-unconfirmed`, never success.
-  `verify? false` is the fast path: wait up to 1.5 s for the rev to advance and
+  `verify: false` is the fast path: wait up to 1.5 s for the rev to advance and
   report `verified: ack`.
 - **At most one emit per write.** The adapter never re-emits after an emit. If
   the poll cannot confirm the result, the caller must re-read and decide; the
@@ -26,7 +26,7 @@ HedgeDoc project.
 - **Revisions are socket-scoped.** A reconnect invalidates the local rev.
   Writes are refused with `rev-unknown` until a `doc` frame supplies the new
   revision; the adapter re-joins after a resync rather than guessing.
-- **Dry-run is real.** `dry-run?` returns a numbered window around the edit,
+- **Dry-run is real.** `dryRun: true` returns a numbered window around the edit,
   not a preview of the whole document.
 - **One worker per note.** The default binary runs one isolated core process
   per note, so notes never share sockets, revision state or an in-flight write.
@@ -155,8 +155,10 @@ Claude Desktop and other `mcpServers` clients:
 
 In the default multi-note binary, every tool except `list-notes` accepts an
 optional `note-id`. The single-note `core.mjs` rejects `note-id`. Writes accept
-`dry-run?` and `verify?`; `set-note` instead requires `force` + `reason` and
-takes neither flag.
+`dryRun` and `verify`; `set-note` instead requires `force` + `reason` and
+takes neither flag. `search` takes `regex` and `caseSensitive`. The older
+`dry-run?`, `verify?`, `regex?`, and `case-sensitive?` spellings are accepted
+as aliases, but new clients should use the camelCase names.
 
 Typical loop: `get-status` → `read-note`/`read-section` → dry-run → real write
 → `get-status` (or trust `verified: download-poll`). On `stale-revision`,
@@ -170,12 +172,12 @@ re-emit.
   local rev, and the adapter re-joins for a `doc` frame before writing.
 - Writes are serialized per note: a second concurrent write is rejected with
   `emit-in-flight`; retry after the first completes.
-- Verification costs ~0.5–1 s per write; `verify? false` returns after the ack
+- Verification costs ~0.5–1 s per write; `verify: false` returns after the ack
   (bounded by a 1.5 s wait for the rev to advance).
 - A remote edit changes the document under you. CAS rejects the write if the
   rev moved; the pre-emit overlap check aborts if a remote selection covers the
   target.
-- `search` with `regex? true` runs JavaScript's backtracking engine over note
+- `search` with `regex: true` runs JavaScript's backtracking engine over note
   lines. A pathological pattern on a very long line can block the worker; the
   multi-note supervisor recycles a worker after 180 s. Prefer substrings for
   untrusted patterns.

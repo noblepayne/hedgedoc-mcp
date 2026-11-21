@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.2.1 — 2026-11-21
+
+### Fixed
+
+- Tool arguments use camelCase wire names: `dryRun`, `verify`, `regex`,
+  `caseSensitive`. The old `dry-run?`, `verify?`, `regex?` and
+  `case-sensitive?` names are accepted as aliases, as are `dry-run` and
+  `dry_run`. A client or model that strips the question mark can no longer
+  turn a dry run into a write.
+- A dry run returns `status: dry-run`, `written: false`, and the current
+  `base-rev`/`base-hash`. It no longer reports `new-rev` as if the write
+  happened.
+- Unknown arguments return `bad-args` instead of an internal error caused by
+  an unbound `clojure.string` reference.
+
 ## 0.2.0 — 2026-11-21
 
 First public release.

@@ -38,7 +38,7 @@ function makeEnv({ content, send, download, onFirstSend }) {
     text: '+ appended once',
     'base-rev': snap.rev,
     'base-hash': snap.hash,
-    'verify?': true,
+    verify: true,
   };
   return { env, state, inflight, args, snap };
 }

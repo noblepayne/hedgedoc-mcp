@@ -47,7 +47,7 @@
 ;; ---------------- constants ----------------
 
 (def server-name "hedgedoc-mcp")
-(def server-version "0.2.0")
+(def server-version "0.2.1")
 (def mcp-protocol-version "2024-11-05")
 
 (def default-idle-ms 30000)
@@ -781,10 +781,10 @@
     (connected-check! env)
     (tools/replace-lines env {:base-rev base-rev :base-hash base-hash
                               :edits edits
-                              :dry-run? (boolean (:dry-run? args))
-                              :verify? (if (contains? args :verify?)
-                                         (boolean (:verify? args))
-                                         true)})))
+                              :dryRun (boolean (:dryRun args))
+                              :verify (if (contains? args :verify)
+                                      (boolean (:verify args))
+                                      true)})))
 
 (defn- handle-insert-lines [args]
   (let [env @env_
@@ -799,9 +799,9 @@
     (connected-check! env)
     (tools/insert-lines env {:base-rev base-rev :base-hash base-hash
                              :line line :text text
-                             :dry-run? (boolean (:dry-run? args))
-                             :verify? (if (contains? args :verify?)
-                                        (boolean (:verify? args))
+                             :dryRun (boolean (:dryRun args))
+                             :verify (if (contains? args :verify)
+                                        (boolean (:verify args))
                                         true)})))
 
 (defn- handle-delete-lines [args]
@@ -819,9 +819,9 @@
     (connected-check! env)
     (tools/delete-lines env {:base-rev base-rev :base-hash base-hash
                              :line line :count count
-                             :dry-run? (boolean (:dry-run? args))
-                             :verify? (if (contains? args :verify?)
-                                        (boolean (:verify? args))
+                             :dryRun (boolean (:dryRun args))
+                             :verify (if (contains? args :verify)
+                                        (boolean (:verify args))
                                         true)})))
 
 (defn- handle-search [args]
@@ -835,8 +835,8 @@
                 v)]
     (require-state! env)
     (tools/search env {:query query
-                       :regex? (boolean (:regex? args))
-                       :case-sensitive? (boolean (:case-sensitive? args))
+                       :regex (boolean (:regex args))
+                       :caseSensitive (boolean (:caseSensitive args))
                        :limit limit})))
 
 (defn- handle-presence [_args]
@@ -868,8 +868,8 @@
                                                       :field :new-section-text
                                                       :got v})))
                                    v))
-                (:dry-run? args) (assoc :dry-run? (boolean (:dry-run? args)))
-                (contains? args :verify?) (assoc :verify? (boolean (:verify? args))))]
+                (:dryRun args) (assoc :dryRun (boolean (:dryRun args)))
+                (contains? args :verify) (assoc :verify (boolean (:verify args))))]
       (when has-text?
         (checked-str args :heading))
       (require-state! env)
@@ -892,9 +892,9 @@
     (tools/append-to-section env {:heading heading :text text
                                   :base-rev base-rev :base-hash base-hash
                                   :occurrence occurrence
-                                  :dry-run? (boolean (:dry-run? args))
-                                  :verify? (if (contains? args :verify?)
-                                             (boolean (:verify? args))
+                                  :dryRun (boolean (:dryRun args))
+                                  :verify (if (contains? args :verify)
+                                             (boolean (:verify args))
                                              true)})))
 
 (defn- handle-set-note [args]
@@ -950,6 +950,31 @@
               :text (js/JSON.stringify (clj->js (err-map e)))}]
    :isError true})
 
+(def ^:private arg-aliases
+  "Wire aliases accepted for the canonical camelCase arguments. LLM clients
+   strip or rewrite '?', so the wire names must not contain it; old names keep
+   working for callers already written against 0.2.0."
+  {:dry-run :dryRun
+   :dry_run :dryRun
+   :dry-run? :dryRun
+   :dryRun? :dryRun
+   :verify? :verify
+   :regex? :regex
+   :case-sensitive :caseSensitive
+   :case_sensitive :caseSensitive
+   :case-sensitive? :caseSensitive
+   :caseSensitive? :caseSensitive})
+
+(defn- normalize-args [args]
+  (reduce (fn [m [k v]]
+            (let [ck (get arg-aliases k k)]
+              (when (and (contains? m ck) (not= (get m ck) v))
+                (throw (ex-info "conflicting argument aliases"
+                                {:code :bad-args :field ck
+                                 :values [(get m ck) v]})))
+              (assoc m ck v)))
+          {} args))
+
 (defn- value-matches-type? [t v]
   (case t
     "integer" (integer? v)
@@ -967,7 +992,7 @@
         allowed (set (keys props))
         extra (vec (remove #(contains? allowed %) (keys args)))]
     (when (seq extra)
-      (throw (ex-info (str "unknown argument(s): " (clojure.string/join ", " extra))
+      (throw (ex-info (str "unknown argument(s): " (str/join ", " extra))
                       {:code :bad-args
                        :unknown extra
                        :allowed (vec allowed)
@@ -1020,7 +1045,9 @@
             (reply-ok id (is-error-result
                           (ex-info (str "unknown tool: " pname)
                                    {:code :unknown-tool :name pname})))
-            (-> (execute-tool (fn [a] (validate-args! pname a) (h a))
+            (-> (execute-tool (fn [raw] (let [a (normalize-args raw)]
+                                          (validate-args! pname a)
+                                          (h a)))
                               (or (:arguments params) {}))
                 (.then (fn [result] (reply-ok id result)))
                 (.catch (fn [e]
