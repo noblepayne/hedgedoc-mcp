@@ -1,0 +1,59 @@
+# local HedgeDoc dev box (podman) — mirrors stage, disposable.
+# Usage:
+#   podman-compose -f dev/compose.yml up -d
+#   node dev/seed.mjs            # prints note IDs
+#   HEDGEDOC_URL=http://localhost:3000 node test/e2e-*.mjs
+#   podman-compose -f dev/compose.yml down -v   # wipes everything
+# Never Traefik, never TLS, never prod data. Guest-open on loopback only.
+name: hedgedoc-dev
+
+services:
+  pg-dev:
+    image: postgres:18.6-alpine # TODO: digest-pin once green
+    container_name: hedgedoc-dev-pg
+    restart: "no" # ephemeral: `down -v` wipes it, that's the point
+    environment:
+      - POSTGRES_USER=hackmd
+      - POSTGRES_PASSWORD=hackmdpass # dev-only secret, never leaves loopback
+      - POSTGRES_DB=hackmd
+      - PGDATA=/var/lib/postgresql/data/pgdata
+    volumes:
+      - pgdata:/var/lib/postgresql/data/pgdata
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hackmd -d hackmd"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  app-dev:
+    # HedgeDoc 1.12: the Socket.IO 4 generation this client targets.
+    image: quay.io/hedgedoc/hedgedoc:1.12.0 # TODO: digest-pin once green
+    container_name: hedgedoc-dev-app
+    restart: "no"
+    depends_on:
+      pg-dev:
+        condition: service_healthy
+    environment:
+      # Deliberately guest-open so a fresh clone can run the harness without
+      # creating accounts. Loopback only; never copy these to a public host.
+      - CMD_DB_URL=postgres://hackmd:hackmdpass@pg-dev:5432/hackmd
+      - CMD_DOMAIN=localhost
+      - CMD_URL_ADDPORT=true
+      - CMD_PROTOCOL_USESSL=false
+      - CMD_CSP_ENABLE=false
+      - CMD_ALLOW_ANONYMOUS=true
+      - CMD_ALLOW_ANONYMOUS_EDITS=true
+      - CMD_ALLOW_FREEURL=true
+      - CMD_REQUIRE_FREEURL_AUTHENTICATION=false
+      # dev-only: real 1.12 limiters, raised so the scenario suite can log in repeatedly
+      - CMD_RATE_LIMIT_USER=100000
+      - CMD_RATE_LIMIT_NEW_NOTES=100000
+      - CMD_RATE_LIMIT_USING_CLOUDFLARE=false
+    volumes:
+      - uploads:/hedgedoc/public/uploads
+    ports:
+      - "127.0.0.1:3000:3000" # loopback only
+
+volumes:
+  pgdata:
+  uploads:

@@ -1,0 +1,20 @@
+{
+  "mcp": {
+    "hedgedoc": {
+      "type": "local",
+      "command": [
+        "hedgedoc-mcp"
+      ],
+      "environment": {
+        "HEDGEDOC_URL": "http://localhost:3000",
+        "HEDGEDOC_EMAIL": "<bot-account-email>",
+        "HEDGEDOC_PASSWORD": "<bot-account-password>",
+        "HEDGEDOC_NOTE_ID": "<default-note-id>",
+        "HEDGEDOC_CLIENT_MAJOR": "4",
+        "HEDGEDOC_MAX_NOTES": "8",
+        "HEDGEDOC_ALLOW_GUEST_WRITES": "false",
+        "HEDGEDOC_ENABLE_SET_NOTE": "false"
+      }
+    }
+  }
+}
