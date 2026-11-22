@@ -115,8 +115,7 @@
   (let [new-rev (:rev @state)
         new-hash (st/content-hash @state)
         preview (subs (:new-content pre) 0
-                      (min (or (:preview-chars pre) 2000)
-                           (m/utf16-length (:new-content pre))))]
+                      (min 2000 (m/utf16-length (:new-content pre))))]
     (if (:ok poll)
       {:new-rev new-rev
        :new-hash new-hash
@@ -131,6 +130,7 @@
        :verified false
        :via :none
        :status :applied-but-unconfirmed
+       :retryable false
        :expected-hash (m/content-hash (:new-content pre))
        :server-hash (when (:content poll) (m/content-hash (:content poll)))
        :hint "write may be applied; do NOT re-emit without verifying rev-did-not-advance"
@@ -147,37 +147,68 @@
 
 ;; ---------- 1. get-status ----------
 
+(defn writable?
+  "Write readiness: a revision learned on this socket generation, a live
+   connection, and a session allowed to join the OT room. A missing (nil) or
+   :unknown auth probe counts as allowed; the server stays the authority and
+   CAS still protects content, matching write-auth-check!."
+  [{:keys [state connected? auth allow-guest-writes?]}]
+  (let [v @state
+        a (when (some? auth) (auth))]
+    (and (some? v)
+         (>= (:rev v) 0)
+         (boolean (connected?))
+         (or (true? allow-guest-writes?)
+             (not= :guest (:kind a))))))
+
 (defn get-status
-  "=> {:rev :hash :snapshot-id :sections :remote-idle-ms :rev-velocity :connected :auth}"
-  [{:keys [state connected? now-ms auth]}]
+  "=> {:rev :hash :snapshot-id :sections :remote-idle-ms :rev-velocity
+       :rev-known :connected :auth :writable :hint}
+   Nil-tolerant: before boot lands, rev is -1, hash/snapshot-id are nil, there
+   are no sections, and the timing fields are nil -- never an error."
+  [{:keys [state connected? now-ms auth] :as env}]
   (let [now (now-ms)
         a (when (some? auth) (auth))
-        v @state]
-    {:rev (:rev v)
-     :hash (st/content-hash v)
-     :snapshot-id (st/snapshot-id v)
-     :sections (mapv #(select-keys % [:level :heading :normalized :occurrence :count])
-                     (ops/parse-sections (:content v)))
-     :remote-idle-ms (st/remote-idle-ms v now)
-     :rev-velocity (st/rev-velocity v now)
-     :rev-known (>= (:rev v) 0)
+        v @state
+        rev (if (some? v) (:rev v) -1)]
+    {:rev rev
+     :hash (when (some? v) (st/content-hash v))
+     :snapshot-id (when (some? v) (st/snapshot-id v))
+     :sections (if (some? v)
+                 (mapv #(select-keys % [:level :heading :normalized :occurrence :count])
+                       (ops/parse-sections (:content v)))
+                 [])
+     :remote-idle-ms (when (some? v) (st/remote-idle-ms v now))
+     :rev-velocity (when (some? v) (st/rev-velocity v now))
+     :rev-known (>= rev 0)
      :connected (boolean (connected?))
      :auth (select-keys (or a {}) [:kind :status :name])
-     :hint (when (< (:rev v) 0)
+     :writable (writable? env)
+     :hint (when (< rev 0)
              "worker is still booting (login/download/socket); call get-status again")}))
 
 ;; ---------- 2. read-section ----------
 
 (defn read-section
-  "{:heading :occurrence?} => {:rev :hash :content :start :end}. Scoped read."
-  [{:keys [state]} {:keys [heading occurrence]}]
+  "{:heading :occurrence? :level? :includeSubsections?} => {:rev :hash :content
+   :start :end}. Scoped read; with :includeSubsections the slice runs to the
+   next heading at or above the target's level. writeRoundTrip: false and the
+   hint are added ONLY for a subtree read, so the default shape is unchanged."
+  [{:keys [state]} {:keys [heading occurrence level includeSubsections]}]
   (when (or (not (string? heading)) (str/blank? heading))
     (throw (err :bad-args {:field :heading :got heading})))
   (let [v @state
-        m (ops/read-section (ops/parse-sections (:content v))
-                            (:content v) heading {:occurrence occurrence})]
-    {:rev (:rev v) :hash (st/content-hash v)
-     :content (:content m) :start (:start m) :end (:end m)}))
+        content (:content v)
+        sections (ops/parse-sections content)
+        opts {:occurrence occurrence :level level}
+        {:keys [start end]} (if includeSubsections
+                              (ops/subtree-range sections content heading opts)
+                              (ops/section-anchor sections content heading opts))]
+    (cond-> {:rev (:rev v) :hash (st/content-hash v)
+             :content (subs content start end) :start start :end end}
+      includeSubsections
+      (assoc :writeRoundTrip false
+             :hint "subtree read is read-only until subtree writes land: apply-ops new-section-text and append-to-section still replace/append the section body only, so writing this parent body back would drop its child headings"))))
 
 ;; ---------- preview + line helpers ----------
 
@@ -187,52 +218,178 @@
   (let [n (min (max 0 offset) (m/utf16-length content))]
     (inc (count (re-seq #"\n" (subs content 0 n))))))
 
-(defn- preview-window
+;; Dry-run preview caps: first limit wins, whole lines only (a straddling line
+;; is dropped, so a preview never exceeds either bound).
+(def ^:private preview-max-units 4000)
+(def ^:private preview-max-lines 200)
+(def ^:private preview-tail-lines 12)
+
+(defn- window-range
+  "1-based [start end] line range of the +-radius window around `at`."
+  [content at radius]
+  (let [l (line-of-offset content at)
+        n (count (str/split-lines content))]
+    [(max 1 (- l radius)) (min n (+ l radius))]))
+
+(defn- render-numbered
+  "`n | line` for the inclusive 1-based range [lo, hi] of the line vector."
+  [lines lo hi]
+  (str/join "\n" (map (fn [i] (str i " | " (nth lines (dec i))))
+                      (range lo (inc hi)))))
+
+(defn- rendered-units
+  "UTF-16 units of one rendered `n | line` entry (the 3 is \" | \")."
+  [i line]
+  (+ 3 (m/utf16-length (str i)) (m/utf16-length line)))
+
+(defn- cap-forward
+  "Whole-line forward cap over [lo, hi]: at most 200 lines or 4000 UTF-16
+   units of RENDERED text (line numbers included, so the returned preview
+   never exceeds the cap). Returns the kept inclusive range."
+  [lines lo hi]
+  (let [hi (min hi (count lines))
+        lo (max 1 lo)]
+    (loop [i lo units 0]
+      (cond
+        (> i hi) {:lo lo :hi hi}
+        (>= (- i lo) preview-max-lines) {:lo lo :hi (dec i)}
+        :else
+        (let [w (+ (rendered-units i (nth lines (dec i))) (if (= i lo) 0 1))]
+          (if (> (+ units w) preview-max-units)
+            {:lo lo :hi (dec i)}
+            (recur (inc i) (+ units w))))))))
+
+(defn- cap-tail
+  "Whole-line backward cap: keep the LAST up-to-12 lines of [lo, hi] that fit
+   in 4000 UTF-16 units of rendered text, so `tail` really shows the end of
+   the region."
+  [lines lo hi]
+  (let [hi (min hi (count lines))
+        lo (max 1 lo)
+        tlo (max lo (- hi (dec preview-tail-lines)))]
+    (loop [i hi units 0]
+      (cond
+        (< i lo) {:lo lo :hi hi}
+        (< i tlo) {:lo (inc i) :hi hi}
+        :else
+        (let [w (+ (rendered-units i (nth lines (dec i))) (if (= i hi) 0 1))]
+          (if (> (+ units w) preview-max-units)
+            {:lo (inc i) :hi hi}
+            (recur (dec i) (+ units w))))))))
+
+(defn preview-window
   "Numbered window of lines around `at`, +-radius. A dry-run at line 300
-   must show line 300, not the first 2KB of the document."
+   must show line 300, not the first 2KB of the document. Success-path
+   previews keep this shape unchanged."
   [content at radius]
   (let [lines (vec (str/split-lines content))
-        l (line-of-offset content at)
-        start (max 1 (- l radius))
-        end (min (count lines) (+ l radius))
+        [start end] (window-range content at radius)
         body (map-indexed (fn [i line] (str (+ start i) " | " line))
                           (subvec lines (dec start) end))]
     {:text (str/join "\n" body)
      :start-line start
      :end-line end}))
 
+(defn preview-dry-run
+  "Dry-run preview for one `preview` mode. -> {:preview :preview-lines
+   :preview-mode :preview-total-lines :preview-truncated}. `span` is an
+   affected-span over the resolved ops; the preview is read from the NEW
+   content, except a pure delete (empty new span), which previews the lines it
+   removes from `old-content`. `window` keeps the six-line radius around
+   `target-start`; `region` shows the whole affected range; `tail` shows its
+   last 12 lines. Cap: 200 lines or 4000 UTF-16 units of rendered text, first
+   limit wins, whole lines only. Pure."
+  [mode new-content old-content span target-start]
+  (let [{:keys [old-start old-end new-start new-end]} span
+        [lines lo hi] (if (> new-end new-start)
+                        [ (vec (str/split-lines new-content))
+                          (line-of-offset new-content new-start)
+                          (line-of-offset new-content (max new-start (dec new-end)))]
+                        [ (vec (str/split-lines old-content))
+                          (line-of-offset old-content old-start)
+                          (line-of-offset old-content (max old-start (dec old-end)))])
+        total (max 0 (inc (- hi lo)))
+        mode (or mode "window")
+        [rlo rhi want] (case mode
+                         "window" (let [[s e] (window-range new-content target-start 6)]
+                                    [s e (max 0 (inc (- e s)))])
+                         "region" [lo hi total]
+                         "tail" [(max lo (- hi (dec preview-tail-lines))) hi
+                                 (min total preview-tail-lines)]
+                         (throw (err :bad-args
+                                     {:field :preview :got mode
+                                      :allowed ["window" "region" "tail"]})))
+        kept (if (= mode "tail")
+               (cap-tail lines rlo rhi)
+               (cap-forward lines rlo rhi))
+        shown (max 0 (inc (- (:hi kept) (:lo kept))))]
+    {:preview (if (pos? shown) (render-numbered lines (:lo kept) (:hi kept)) "")
+     :preview-lines {:start-line (if (pos? shown) (:lo kept) rlo)
+                     :end-line (:hi kept)}
+     :preview-mode mode
+     :preview-total-lines total
+     :preview-truncated (or (< shown total) (< shown want))}))
+
 ;; ---------- 2b. read-note ----------
 
 (defn read-note
-  "{:offset? :limit?} => whole/paginated note with line numbers on sections.
-   Default: up to 2000 lines. Front matter is visible here (sections are not)."
-  [{:keys [state]} {:keys [offset limit]}]
+  "{:offset? :limit? :sections?} => whole/paginated note with line numbers on
+   sections. Default: up to 2000 lines. :sections is \"all\" (default),
+   \"none\", or \"window\" (only headings whose start offset falls inside the
+   returned slice). Front matter is visible here (sections are not)."
+  [{:keys [state]} {:keys [offset limit sections]}]
   (when (and (some? offset) (or (not (integer? offset)) (< offset 1)))
     (throw (err :bad-args {:field :offset :got offset :reason :must-be-positive})))
   (when (and (some? limit) (or (not (integer? limit)) (< limit 1)))
     (throw (err :bad-args {:field :limit :got limit :reason :must-be-positive})))
-  (let [v @state
-        content (:content v)
-        lines (vec (str/split-lines content))
-        total (count lines)
-        start (min (max 1 (or offset 1)) (max 1 total))
-        lim (min (or limit 2000) 2000)
-        end (min total (+ start (dec lim)))
-        slice (if (<= start end) (subvec lines (dec start) end) [])
-        sections (mapv (fn [sec]
-                         (assoc (select-keys sec [:level :heading :occurrence])
-                                :line (line-of-offset content (:start sec))))
-                       (ops/parse-sections content))]
-    {:rev (:rev v)
+  (let [mode (if (nil? sections) "all" sections)]
+    (when-not (contains? #{"all" "none" "window"} mode)
+      (throw (err :bad-args {:field :sections :got sections
+                             :allowed ["all" "none" "window"]
+                             :hint "use \"none\" instead of a boolean"})))
+    (let [v @state
+          content (:content v)
+          lines (vec (str/split-lines content))
+          total (count lines)
+          start (min (max 1 (or offset 1)) (max 1 total))
+          lim (min (or limit 2000) 2000)
+          end (min total (+ start (dec lim)))
+          slice (if (<= start end) (subvec lines (dec start) end) [])
+          slice-text (str/join "\n" slice)
+          ;; Slice offsets are computed once; sections are filtered by :start
+          ;; instead of rescanning per heading. Line numbers stay absolute.
+          slice-start (if (= start 1)
+                        0
+                        (inc (m/utf16-length
+                              (str/join "\n" (subvec lines 0 (dec start))))))
+          slice-end (+ slice-start (m/utf16-length slice-text))
+          describe (fn [sec]
+                     (assoc (select-keys sec [:level :heading :occurrence])
+                            :line (line-of-offset content (:start sec))))
+          parsed (ops/parse-sections content)
+          sections (case mode
+                     "none" []
+                     "all" (mapv describe parsed)
+                     "window" (mapv
+                               (fn [sec]
+                                 (assoc (select-keys sec [:level :heading :occurrence])
+                                        :line (+ (dec start)
+                                                 (line-of-offset
+                                                  slice-text
+                                                  (- (:start sec) slice-start)))))
+                               (filter #(and (>= (:start %) slice-start)
+                                             (< (:start %) slice-end))
+                                       parsed)))]
+      {:rev (:rev v)
      :hash (st/content-hash v)
      :doc-length (m/utf16-length content)
      :length (m/utf16-length (str/join "\n" slice))
      :total-lines total
      :start-line start
      :end-line end
-     :truncated (< end total)
-     :content (str/join "\n" slice)
-     :sections sections}))
+       :truncated (< end total)
+       :content (str/join "\n" slice)
+       :sections sections})))
 
 ;; ---------- ack wait (fast path) ----------
 
@@ -249,7 +406,7 @@
 
 ;; ---------- reconnect/retry helpers ----------
 
-(defn- wait-for-writable!
+(defn wait-for-writable!
   "Connected AND holding a revision learned on this socket generation. A
    reconnect invalidates the rev; writing before the next doc frame would use
    -1 or a stale base."
@@ -299,21 +456,20 @@
      (let [resolved (ops/resolve-ops (:content snap) args)
            new-content (ops/apply-ops (:content snap) (:ops resolved))]
        (when dry-run?
-         (throw (ex-info "dry-run preview"
-                          {:code :dry-run-preview
-                           :dry-run true
-                           :status :dry-run
-                           :written false
-                           :base-rev (:rev snap)
-                           :base-hash (:hash snap)
-                           :would-be-hash (m/content-hash new-content)
-                           :preview (:text (preview-window new-content
-                                                                           (:target-start resolved) 6))
-                           :preview-lines (select-keys (preview-window new-content
-                                                                                       (:target-start resolved) 6)
-                                                                       [:start-line :end-line])
-                           :ops (:ops resolved)
-                           :hint "no write was emitted; rev and hash are the current base"})))
+         (let [span (ops/affected-span (:ops resolved))]
+           (throw (ex-info "dry-run preview"
+                           (merge {:code :dry-run-preview
+                                   :dry-run true
+                                   :status :dry-run
+                                   :written false
+                                   :base-rev (:rev snap)
+                                   :base-hash (:hash snap)
+                                   :would-be-hash (m/content-hash new-content)
+                                   :ops (:ops resolved)
+                                   :hint "no write was emitted; rev and hash are the current base"}
+                                  (preview-dry-run (:preview args) new-content
+                                                   (:content snap) span
+                                                   (:target-start resolved)))))))
        (ops/overlap-check (get-presence) (:target-start resolved) (:target-end resolved) (:rev snap))
        (let [fresh @state]
          (when (not= (:rev fresh) (:rev snap))
@@ -435,9 +591,9 @@
 ;; ---------- 4. append-to-section ----------
 
 (defn append-to-section
-  "{:heading :base-rev :base-hash :text :occurrence? :dryRun :verify}"
+  "{:heading :base-rev :base-hash :text :occurrence? :dryRun :verify :preview}"
   [{:keys [connected?] :as env} {:keys [heading base-rev base-hash text occurrence
-                                        dryRun verify]}]
+                                        dryRun verify preview]}]
   (when (or (not (string? heading)) (str/blank? heading))
     (throw (err :bad-args {:field :heading :got heading})))
   (when (not (string? text))
@@ -453,7 +609,7 @@
           computed (ops/append-to-section-ops
                     (:content snap) sections heading text {:occurrence occurrence})]
       (emit-with-cas! env
-                      {:ops computed :verify? verify}
+                      {:ops computed :verify? verify :preview preview}
                       {:op-id (str (random-uuid))
                        :base-rev base-rev :base-hash base-hash
                        :dry-run? (boolean dryRun)}))))
@@ -461,9 +617,9 @@
 ;; ---------- 4b. replace-lines ----------
 
 (defn replace-lines
-  "{:base-rev :base-hash :edits [{:line :old :new}] :dryRun :verify}
+  "{:base-rev :base-hash :edits [{:line :old :new}] :dryRun :verify :preview}
    1-based lines, exact :old match, single-line :new, batch applied bottom-up."
-  [{:keys [connected?] :as env} {:keys [base-rev base-hash edits dryRun verify]}]
+  [{:keys [connected?] :as env} {:keys [base-rev base-hash edits dryRun verify preview]}]
   (when (or (not (integer? base-rev)) (not (string? base-hash)))
     (throw (err :bad-args {:fields [:base-rev :base-hash]})))
   (when (or (not (sequential? edits)) (empty? edits))
@@ -477,14 +633,14 @@
           (ops/replace-lines->ops (:content snap) edits)]
     (emit-with-cas! env
                     {:ops ops :target-range [target-start target-end]
-                     :verify? verify}
+                     :verify? verify :preview preview}
                       {:op-id (str (random-uuid))
                        :base-rev base-rev :base-hash base-hash
                        :dry-run? (boolean dryRun)}))))
 
 (defn insert-lines
-  "{:base-rev :base-hash :line :text :dryRun :verify} insert before line."
-  [{:keys [connected?] :as env} {:keys [base-rev base-hash line text dryRun verify]}]
+  "{:base-rev :base-hash :line :text :dryRun :verify :preview} insert before line."
+  [{:keys [connected?] :as env} {:keys [base-rev base-hash line text dryRun verify preview]}]
   (when (or (not (integer? base-rev)) (not (string? base-hash)))
     (throw (err :bad-args {:fields [:base-rev :base-hash]})))
   (write-auth-check! env)
@@ -496,14 +652,14 @@
           (ops/insert-lines->ops (:content snap) line text)]
       (emit-with-cas! env
                       {:ops ops :target-range [target-start target-end]
-                       :verify? verify}
+                       :verify? verify :preview preview}
                       {:op-id (str (random-uuid))
                        :base-rev base-rev :base-hash base-hash
                        :dry-run? (boolean dryRun)}))))
 
 (defn delete-lines
-  "{:base-rev :base-hash :line :count? :dryRun :verify} delete lines."
-  [{:keys [connected?] :as env} {:keys [base-rev base-hash line count dryRun verify]}]
+  "{:base-rev :base-hash :line :count? :dryRun :verify :preview} delete lines."
+  [{:keys [connected?] :as env} {:keys [base-rev base-hash line count dryRun verify preview]}]
   (when (or (not (integer? base-rev)) (not (string? base-hash)))
     (throw (err :bad-args {:fields [:base-rev :base-hash]})))
   (write-auth-check! env)
@@ -515,7 +671,7 @@
           (ops/delete-lines->ops (:content snap) line (or count 1))]
       (emit-with-cas! env
                       {:ops ops :target-range [target-start target-end]
-                       :verify? verify}
+                       :verify? verify :preview preview}
                       {:op-id (str (random-uuid))
                        :base-rev base-rev :base-hash base-hash
                        :dry-run? (boolean dryRun)}))))

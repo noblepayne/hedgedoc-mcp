@@ -26,7 +26,7 @@ Unofficial client. Not affiliated with or endorsed by the HedgeDoc project.
 
 | Item | State |
 |---|---|
-| Version | `0.2.1` |
+| Version | `0.2.2` |
 | HedgeDoc 1.12 | Tested |
 | HedgeDoc 1.11 | Expected to work, not exercised yet |
 | HedgeDoc 1.10 and older | Refused at connect (they use Socket.IO 2) |
@@ -154,10 +154,21 @@ Start the client and give the agent the note id. A useful first prompt:
 > Show me the preview and do not write until I say so.
 
 The first `get-status` can return `rev: -1` and `connected: false` while the
-server logs in and joins the note. Call it again after a second. Once the rev is
-a number, the session is ready.
+server logs in and joins the note. Call it again after a second, or pass
+`waitMs: 5000` to hold the call until boot lands. `waitMs` takes an integer from
+0 to 15000 and defaults to 0. The wait costs wall-clock time on that call, at
+most the number you pass.
+
+`writable` tells you whether a write can go out now: the revision is known, the
+socket is connected, and the session may join the OT room. A cold or
+disconnected worker returns `writable: false` with a `hint` that says it is
+still booting. That is normal while the backend is down, not an error, and the
+status is still complete, with `rev: -1` before boot. `rev-known` reports the
+revision on its own, and `waitedMs` reports how long the wait took.
 
 A dry run returns a window of numbered lines around the edit and writes nothing.
+Pass `preview: "region"` to see the whole affected range, or `preview: "tail"`
+for its last 12 lines. `window` is the default and keeps the six-line radius.
 The example is abridged. The full result also carries `would-be-hash`,
 `preview-lines`, and `ops`, and it has no `new-rev` because nothing was emitted.
 
@@ -172,6 +183,14 @@ The example is abridged. The full result also carries `would-be-hash`,
   "hint": "no write was emitted; rev and hash are the current base"
 }
 ```
+
+A dry run on the five write tools also returns `preview-mode` (the mode you
+asked for), `preview-lines` (`start-line` and `end-line` for the returned
+window), `preview-total-lines` (lines in the affected range before truncation),
+and `preview-truncated` (true when the mode does not show the whole range). A
+preview stops at 200 lines or 4000 UTF-16 units of rendered text, whichever
+comes first, and it keeps whole lines. These keys appear on dry runs only; an
+actual write keeps the success shape below.
 
 If the preview looks right, call the same tool with `dryRun: false`. A write that
 lands reports how the server checked it:
@@ -228,13 +247,36 @@ A second write on the same note while one is running is rejected with
 The default binary runs an isolated core process for each note, so notes do not
 share a socket, revision state, or in-flight write.
 
+### Errors and retry advice
+
+A tool error carries `code`, `message`, and `data`. Five codes add a top-level
+`retryable` flag next to those keys:
+
+| Code | `retryable` | `retryAfterMs` |
+|---|---|---|
+| `not-connected` | true | 1000 |
+| `rev-unknown` | false | absent |
+| `stale-revision` | false | absent |
+| `emit-in-flight` | false | absent |
+| `write-needs-user` | false | absent |
+
+`download-failed` and every other error code carry no retry fields, so a client
+that reads `retryable` sees it absent rather than false. A `stale-revision` or
+`rev-unknown` write needs a fresh read and a rebuilt base, not a retry of the
+same one. `not-connected` is the code where a bounded retry after a second is
+the intended behavior.
+
+`applied-but-unconfirmed` is a result, not an error. It has `retryable: false`
+and stays under `status`, because the op may have landed. Re-read the note and
+decide; a blind re-emit can duplicate the edit.
+
 ## Tools
 
 | Tool | What it does |
 |---|---|
-| `get-status` | Reports revision, hash, headings, idle time, rev velocity, auth kind, and connection state. |
-| `read-section` | Returns one heading's content with UTF-16 offsets. `occurrence` picks among duplicate headings. |
-| `read-note` | Returns the note, or a page of lines, with front matter and heading line numbers. |
+| `get-status` | Reports revision, hash, headings, idle time, rev velocity, auth kind, connection state, and `writable`. `waitMs` waits for boot and reports `waitedMs`. |
+| `read-section` | Returns one heading's content with UTF-16 offsets. `occurrence` picks among duplicate headings, `level` narrows by heading level, and `includeSubsections` reads the whole subtree. |
+| `read-note` | Returns the note, or a page of lines, with front matter and heading line numbers. `sections` controls the heading list. |
 | `apply-ops` | Writes raw ops under CAS, or replaces a section body via `new-section-text` plus `heading`. |
 | `append-to-section` | Inserts a block at the end of a section, before the next heading. |
 | `replace-lines` | Applies batch 1-based line edits with an `old` match, bottom-up. |
@@ -250,8 +292,12 @@ share a socket, revision state, or in-flight write.
 | Argument | Tools | Notes |
 |---|---|---|
 | `note-id` | Every tool except `list-notes`, in the multi-note binary | Selects the worker. The single-note `core.mjs` rejects it. |
+| `waitMs` | `get-status` | Integer 0..15000, default 0. Waits up to that many ms for boot to land, then returns the status with `waitedMs`. Costs wall-clock time on the call. |
+| `level`, `includeSubsections` | `read-section` | `level` is 1..6 and filters without a fallback. `includeSubsections: true` reads from after the heading line to the next heading at or above that level, or to the document end. That read adds `writeRoundTrip: false` and a hint. |
+| `sections` | `read-note` | `"all"` (default), `"none"`, or `"window"` for headings inside the returned slice. A boolean is rejected with a hint to use `"none"`. `get-status` still returns every heading. |
 | `base-rev`, `base-hash` | Every write | Taken from a fresh read. A stale base is refused. |
-| `dryRun` | Write tools | Returns the preview window with `status: dry-run` and `written: false`, and emits nothing. Aliases: `dry-run`, `dry_run`, `dry-run?`. |
+| `dryRun` | Write tools | Returns a numbered preview with `status: dry-run` and `written: false`, and emits nothing. Aliases: `dry-run`, `dry_run`, `dry-run?`. |
+| `preview` | `apply-ops`, `append-to-section`, `replace-lines`, `insert-lines`, `delete-lines` | Dry-run only: `"window"` (default, six-line radius around the target), `"region"` (the whole affected range), or `"tail"` (its last 12 lines). `set-note` does not take it. |
 | `verify` | Write tools | `false` skips the download poll and reports `verified: ack` once the revision has advanced and the intended content is visible locally. Alias: `verify?`. |
 | `regex`, `caseSensitive` | `search` | Aliases: `regex?`, `case-sensitive?`. |
 | `force`, `reason` | `set-note` | Required. `set-note` takes none of the flags above. |
@@ -268,14 +314,15 @@ then the write. On `stale-revision`, read again and use the new rev and hash. On
 
 | Result | What to do |
 |---|---|
-| `rev: -1`, `connected: false` | The worker is still booting. Call `get-status` again after a second. |
+| `rev: -1`, `connected: false`, `writable: false` | The worker is still booting. Call `get-status` again, or pass `waitMs`. A down backend keeps `writable` false without failing the call. |
 | `rev-unknown` | The socket reconnected. Call `get-status` and wait for a doc frame. |
-| `not-connected` | The socket is down. Retry after a second. |
+| `not-connected` | The socket is down. `retryable` is true and `retryAfterMs` is 1000, so a retry after a second is expected. |
 | `stale-revision` | The note moved. Read again and use the new rev and hash. |
 | `line-mismatch` | The `old` line is not there anymore. Read the note and fix the edit. |
 | `applied-but-unconfirmed` | Re-read before doing anything else. Do not re-emit blindly. |
 | `emit-in-flight` | Another write is running. Wait for it to finish. |
 | `write-needs-user` | You are a guest. Use the bot account. |
+| `writeRoundTrip: false` on a read | That read included subsections. Subtree writes are not supported yet, so edit the body without `includeSubsections`. |
 | 401 or `unauthorized` | Check the email, password, or cookie. |
 | `oversize` | The write would pass 100 KB. Split it or edit a smaller region. |
 | `download-failed` | Check `HEDGEDOC_URL`, the note id, the cookie, and reachability. |
@@ -286,7 +333,19 @@ then the write. On `stale-revision`, read again and use the new rev and hash. On
   compares against the local copy this server keeps.
 - A write whose result would exceed 100 KB is refused. Larger notes can still be read.
 - ATX headings and backtick fences are recognized. Setext headings and `~~~`
-  fences are not.
+  fences are not. An indented ATX heading is not recognized either, so it does
+  not end a subtree read.
+- A subtree read is read-only. Subtree writes are not supported yet, so
+  `apply-ops` `new-section-text` and `append-to-section` still replace or append
+  the section body only. A subtree read returns `writeRoundTrip: false` as a
+  warning not to feed it back as a body.
+- `length` counts the returned lines joined by `\n`, excluding the newline that
+  ends the last returned line. `doc-length` includes the single trailing
+  newline. `read-section` includes that newline when the section is last.
+- `new-section-text` is inserted verbatim after the heading line. A body
+  starting with `-` therefore removes the blank line that normally separates
+  heading from body. No normalization runs, so include a leading blank line in
+  the text when you want one.
 - There is no undo. HedgeDoc's own history is the recovery path.
 - HedgeDoc 2 is not supported.
 - `search` with `regex: true` uses JavaScript's backtracking engine. A

@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.2.2 — 2026-11-21
+
+### Added
+
+- `get-status` `waitMs` (0..15000) and `writable`, `waitedMs`. A cold worker no
+  longer fails; it waits or returns a nil-tolerant status.
+- Top-level `retryable` / `retryAfterMs` on errors. `not-connected` is
+  retryable after 1 s; `rev-unknown`, `stale-revision`, `emit-in-flight`, and
+  `write-needs-user` are not.
+- `read-section` `includeSubsections` and `level`, with a new pure subtree
+  range and a `writeRoundTrip: false` advisory until subtree writes land.
+- `read-note` `sections`: `"all"`, `"none"`, or `"window"`.
+- `preview`: `"window"`, `"region"`, or `"tail"` on the five write tools, with
+  `preview-mode`, `preview-total-lines`, and `preview-truncated`.
+- Generic `:enum` validation for tool arguments.
+
+### Fixed
+
+- Duplicate headings all reported occurrence 0. Squint compiled
+  `(assoc seen k ...)` with a literal key; `parse-sections` now uses `update`.
+- A cold `get-status` threw `not-booted`; it now returns a status with
+  `writable: false` and a boot hint.
+- The multi-note test now uses `waitMs` instead of expecting a boot error.
+
 ## 0.2.1 — 2026-11-21
 
 ### Fixed

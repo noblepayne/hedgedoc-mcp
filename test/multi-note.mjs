@@ -63,8 +63,8 @@ assert(tools.includes('list-notes'), 'list-notes missing');
 assert('note-id' in (await rpc('tools/list', {})).result.tools.find(t => t.name === 'apply-ops').inputSchema.properties,
        'note-id missing from schema');
 
-const a = await call('get-status');
-const b = await call('get-status', { 'note-id': other });
+const a = await call('get-status', { waitMs: 10000 });
+const b = await call('get-status', { 'note-id': other, waitMs: 10000 });
 assert(a.rev >= 0 && b.rev >= 0, 'a note did not boot');
 const nb = await call('read-note', { 'note-id': other });
 const lines = nb.content.split('\n');

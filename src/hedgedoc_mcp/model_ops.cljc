@@ -78,7 +78,7 @@
               occ (get seen k 0)
               end (if (< (inc j) hn) (:start (nth heads (inc j))) total)]
           (recur (inc j)
-                 (assoc seen k (inc occ))
+                 (update seen k (fnil inc 0))
                  (conj out (assoc h :occurrence occ
                                     :count (get counts k)
                                     :end end))))))))
@@ -89,35 +89,80 @@
   (let [nl (str/index-of normalized "\n" off)]
     (if (nil? nl) (base/utf16-length normalized) (inc nl))))
 
-(defn section->offsets
-  "Anchor lookup -> {:start :end} *content* range (after heading line -> section end).
-   Case/space-insensitive; see anchor semantics above for missing/dup behavior."
-  [sections normalized-content heading {:keys [occurrence]}]
+(defn- resolve-heading
+  "Shared anchor resolution -> section map. Level filters FIRST, then
+   occurrence. Duplicate detection runs on the level-filtered hits, so
+   same-name headings at different levels are not duplicates when :level is
+   given. A supplied level never falls back to another level."
+  [sections heading {:keys [level occurrence]}]
   (let [k    (normalize-heading heading)
-        hits (filterv #(= (:normalized %) k) sections)]
+        same (filterv #(= (:normalized %) k) sections)
+        hits (if (some? level) (filterv #(= (:level %) level) same) same)]
     (cond
       (empty? hits)
       (let [avail (mapv #(:normalized %) sections)
-           dym   (filterv #(or (str/starts-with? % k) (str/starts-with? k %)) avail)]
-        (throw (ex-info (str "missing heading: " heading)
-                        {:code :missing-heading :heading heading :normalized k
-                         :available avail :did-you-mean (vec (take 3 dym))})))
+            dym   (filterv #(or (str/starts-with? % k) (str/starts-with? k %)) avail)
+            base  {:code :missing-heading :heading heading :normalized k
+                   :available avail :did-you-mean (vec (take 3 dym))}]
+        (throw (ex-info (str "missing heading: " heading
+                             (when (some? level) (str " at level " level)))
+                        (if (some? level)
+                          (assoc base :level level
+                                 :candidates (mapv #(select-keys % [:level :occurrence :start :end :heading]) same))
+                          base))))
       (and (> (count hits) 1) (nil? occurrence))
       (throw (ex-info (str "duplicate heading: " heading)
-                      {:code :duplicate-heading :heading heading :normalized k
-                       :candidates (mapv #(select-keys % [:occurrence :start :end :heading]) hits)}))
+                      (cond-> {:code :duplicate-heading :heading heading :normalized k
+                               :candidates (mapv #(select-keys % [:level :occurrence :start :end :heading]) hits)}
+                        (some? level) (assoc :level level))))
       :else
       (let [h (if (some? occurrence) (get hits occurrence) (first hits))]
         (when (nil? h)
           (throw (ex-info (str "occurrence out of range: " heading " #" occurrence)
                           {:code :occurrence-out-of-range :heading heading
                            :normalized k :occurrence occurrence :count (count hits)})))
-        {:start (content-start-of normalized-content (:start h)) :end (:end h)}))))
+        h))))
+
+(defn section-anchor
+  "Anchor lookup -> {:start :end} *content* range (after heading line ->
+   section end). Case/space-insensitive. :level (1..6) filters first: no hit at
+   that level is :missing-heading with :candidates, never a silent fallback.
+   :occurrence then selects within the filtered hits. No :level keeps the
+   level-blind duplicate error."
+  [sections normalized-content heading opts]
+  (let [h (resolve-heading sections heading opts)]
+    {:start (content-start-of normalized-content (:start h)) :end (:end h)}))
+
+(defn subtree-range
+  "Content range {:start :end} for the whole subtree of `heading`: from after
+   the heading line to the next heading whose level is <= the target's level,
+   or doc end. Fence-aware because parse-sections is (a ``` line is not a
+   heading, so it cannot terminate a subtree). Indented ATX headings stay
+   invisible and ~~~ is not a fence, matching parse-sections."
+  [sections normalized-content heading opts]
+  (let [h (resolve-heading sections heading opts)
+        start (content-start-of normalized-content (:start h))
+        end (or (some (fn [s]
+                        (when (and (> (:start s) (:start h))
+                                   (<= (:level s) (:level h)))
+                          (:start s)))
+                      sections)
+                (base/utf16-length normalized-content))]
+    {:start start :end end}))
+
+(defn section->offsets
+  "Anchor lookup -> {:start :end} *content* range (after heading line -> section end).
+   Case/space-insensitive; see anchor semantics above for missing/dup behavior.
+   Write-path signature is frozen: no :level, no subtree flag. Use
+   section-anchor / subtree-range for subtree reads."
+  [sections normalized-content heading {:keys [occurrence]}]
+  (section-anchor sections normalized-content heading {:occurrence occurrence}))
 
 (defn read-section
-  "Convenience: offsets + text slice. Thin wrapper over section->offsets."
-  [sections normalized-content heading {:keys [occurrence]}]
-  (let [{:keys [start end]} (section->offsets sections normalized-content heading {:occurrence occurrence})]
+  "Convenience: offsets + text slice. Thin wrapper over section-anchor."
+  [sections normalized-content heading {:keys [occurrence level]}]
+  (let [{:keys [start end]} (section-anchor sections normalized-content heading
+                                             {:occurrence occurrence :level level})]
     {:start start :end end :content (subs normalized-content start end)}))
 
 ;; ---------- grapheme-safe cuts (UTF-16) ----------
@@ -335,6 +380,32 @@
                     {:code :stale-revision
                      :base-rev base-rev :base-hash base-hash
                      :server-rev (:rev snap) :server-hash (:hash snap)}))))
+
+(defn affected-span
+  "Walk a resolved op list once -> the old and new affected spans:
+   {:old-start :old-end :new-start :new-end} (UTF-16, end exclusive).
+   A pure insert has an empty old span (start = end = the insert point); a
+   pure delete has an empty new span. Exact for replace-lines, insert-lines,
+   delete-lines, append-to-section, raw caller ops, and new-section-text,
+   because it reads the ops instead of guessing from target-end: an append
+   resolves to a suffix ending at doc end, but its affected region is only the
+   inserted block. Pure."
+  [op-list]
+  (loop [pos 0 npos 0 rs op-list
+         os nil oe nil ns nil ne nil]
+    (if (empty? rs)
+      {:old-start (or os pos) :old-end (or oe (or os pos))
+       :new-start (or ns npos) :new-end (or ne (or ns npos))}
+      (let [[op a] (first rs)
+            touched? (not= op :retain)
+            os (if touched? (or os pos) os)
+            ns (if touched? (or ns npos) ns)]
+        (case op
+          :retain (recur (+ pos a) (+ npos a) (rest rs) os oe ns ne)
+          :delete (recur (+ pos a) npos (rest rs) os (+ pos a) ns ne)
+          :insert (let [w (base/utf16-length a)]
+                    (recur pos (+ npos w) (rest rs) os oe ns (+ npos w)))
+          (throw (ex-info "unknown op" {:code :bad-op :op op})))))))
 
 (defn target-range-of-ops
   "Conservative affected range of caller ops: [first-non-retain-pos, len)."

@@ -11,7 +11,7 @@ buildNpmPackage {
   src = ./.;
 
   # Refresh with: nix run nixpkgs#prefetch-npm-deps -- package-lock.json
-  npmDepsHash = "sha256-lIm+bcqmISZxbDjVvPhSsb7G28wR44Xi/eMzbHHqqXA=";
+  npmDepsHash = "sha256-JFb3Fx3UbLVL4pg+DeRUHMoi9qe69/3b4h8iMylmvL0=";
 
   nativeBuildInputs = [nodejs makeWrapper];
 
@@ -27,6 +27,9 @@ buildNpmPackage {
   checkPhase = ''
     runHook preCheck
     node test/version-check.mjs
+    node test/error-shape.mjs
+    node test/model-subtree.mjs
+    node test/affected-span.mjs
     node test/pbt-1-gens.mjs
     node test/pbt-2-transform.mjs --runs 300
     node test/pbt-3-invariants.mjs

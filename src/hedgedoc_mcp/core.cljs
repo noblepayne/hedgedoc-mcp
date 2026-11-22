@@ -35,6 +35,7 @@
      from /download; the first socket DOC frame rebuilds to the true rev.
      Writes before connect fail :not-connected; reads report rev -1."
   (:require [clojure.string :as str]
+            [hedgedoc-mcp.errors :as errors]
             [hedgedoc-mcp.model :as m]
             [hedgedoc-mcp.model-ops :as ops]
             [hedgedoc-mcp.state :as st]
@@ -47,7 +48,7 @@
 ;; ---------------- constants ----------------
 
 (def server-name "hedgedoc-mcp")
-(def server-version "0.2.1")
+(def server-version "0.2.2")
 (def mcp-protocol-version "2024-11-05")
 
 (def default-idle-ms 30000)
@@ -162,109 +163,6 @@
 (defn- log-err [s]
   (.write (.-stderr js/process) (str s "\n")))
 
-(defn- err-message [e]
-  (let [m (when (some? e) (.-message e))]
-    (if (and (some? m) (not (= m ""))) m (str e))))
-
-(defn- err-code [e]
-  (let [c (:code (ex-data e))]
-    (cond (string? c) (str/replace (str c) ":" "")
-          :else "internal")))
-
-(def hint-catalog
-  "One actionable sentence per code. The error data may add its own :hint;
-   that one always wins."
-  {"stale-revision"
-   "Re-read (get-status / read-section) and retry with the new base-rev and base-hash; never reuse the old base."
-
-   "target-moved"
-   "The target changed while the write was in flight. Re-read the section and recompute the edit."
-
-   "overlap-abort"
-   "A remote selection overlaps the target range. Wait for the remote edit to land, or pick a range outside it."
-
-   "missing-heading"
-   "Heading not found. get-status lists every heading; see data.did-you-mean for near matches."
-
-   "duplicate-heading"
-   "Heading appears more than once. Pass :occurrence (0-based) to choose one; see data.candidates."
-
-   "fence-split"
-   "The edit boundary or replacement text would break a fenced code block. Move the boundary or fix the fence."
-
-   "applied-but-unconfirmed"
-   "The ack positioned the op but persistence is unconfirmed. Check get-status; do NOT re-emit."
-
-   "info-abort"
-   "The server refused the operation (see data.info-code). Do not retry unchanged."
-
-   "retry-exhausted"
-   "Bounded retries are exhausted. Re-read the document and start a fresh edit."
-
-   "not-connected"
-   "The socket is down. Check get-status.connected and retry after reconnect."
-
-   "not-booted"
-   "Boot has not landed yet. Retry in a few seconds."
-
-   "write-needs-user"
-   "This is a guest session. Provide a registered HEDGEDOC_COOKIE, or set HEDGEDOC_ALLOW_GUEST_WRITES=true on a guest-open instance."
-
-   "unauthorized"
-   "The session is not allowed to read or edit this note. Check the cookie and the note permission."
-
-   "download-failed"
-   "GET /download failed. Check HEDGEDOC_URL, the note id, the cookie, and network reachability."
-
-   "bad-args"
-   "An argument is wrong. data.field / data.fields name it."
-
-   "incompatible-client"
-   "Server and client majors disagree. Set HEDGEDOC_CLIENT_MAJOR to 4 for HedgeDoc 1.11/1.12."
-
-   "refused"
-   "The operation is refused by policy; see data.reason."
-
-   "rev-unknown"
-   "The revision is unknown after a reconnect. Wait for the doc frame (get-status) and retry."
-
-   "no-op"
-   "The edit changes nothing. Skip it or change the replacement text."
-
-   "oversize"
-   "The result would exceed the 100KB note cap. Split the edit."
-
-   "occurrence-out-of-range"
-   "There are fewer duplicate headings than :occurrence claims. Re-read and retry."
-
-   "emit-in-flight"
-   "Another write is still in flight. Wait for it to finish, then retry."
-
-   "unknown-tool"
-   "No such tool; call tools/list."
-
-   "line-mismatch"
-   "A :old line does not match the document. Re-read (read-note/read-section) and fix the edit."
-
-   "line-out-of-range"
-   "A :line is outside 1..total-lines. Re-read and retry."
-
-   "duplicate-line"
-   "The same :line appears twice in one batch. Merge the edits."})
-
-(defn- hint-for [code]
-  (get hint-catalog (str code)))
-
-(defn- err-map [e]
-  (let [code (err-code e)
-        data (dissoc (or (ex-data e) {}) :code)
-        hint (hint-for code)]
-    {:code code
-     :message (err-message e)
-     :data (if (or (some? (:hint data)) (nil? hint))
-             data
-             (assoc data :hint hint))}))
-
 ;; ---------------- clocks ----------------
 
 (defn- now-ms []
@@ -360,7 +258,7 @@
                  (.then (.json res) handle)))
         (.catch (fn [e]
                   (reset! auth_ {:kind :unknown :checked-at (now-ms)})
-                  (log-err (str "auth: check failed (" (err-message e) ")"))
+                  (log-err (str "auth: check failed (" (errors/err-message e) ")"))
                   nil)))))
 
 (defn- has-credentials? []
@@ -385,7 +283,7 @@
                                " cookie " (if (some? @cookie_) "adopted" "missing")))
                  nil))
         (.catch (fn [e]
-                  (log-err (str "login: failed (" (err-message e) ")"))
+                  (log-err (str "login: failed (" (errors/err-message e) ")"))
                   nil))
         (.then (fn [_]
                  (-> (check-auth!)
@@ -443,7 +341,7 @@
                   ;; content may have moved and CAS would pass against the old
                   ;; hash. -1 forces a doc frame before the next write.
                   (when (some? @state_) (st/invalidate-rev! state_))
-                  (log-err (str "resync (" why ") failed: " (err-message e)))
+                  (log-err (str "resync (" why ") failed: " (errors/err-message e)))
                   (when (t/connected?) (connect-t!))
                   nil)))))
 
@@ -451,8 +349,8 @@
   "A stale/invalid session cookie kills the room join with a plain error.
    Drop it, adopt a fresh one from /download, and reconnect (bounded)."
   [err]
-  (let [msg (str/lower-case (str (err-message err)))]
-    (log-err (str "socket: connect_error " (err-message err)))
+  (let [msg (str/lower-case (str (errors/err-message err)))]
+    (log-err (str "socket: connect_error " (errors/err-message err)))
     (when (and (or (str/includes? msg "cookie is invalid")
                    (str/includes? msg "auth failed"))
                (not @cookie-refresh-in-flight_)
@@ -465,7 +363,7 @@
                    (connect-t!)))
           (.catch (fn [e]
                     (log-err (str "socket: cookie refresh failed ("
-                                  (err-message e) ")"))))
+                                  (errors/err-message e) ")"))))
           (.finally (fn [] (reset! cookie-refresh-in-flight_ false)))))))
 
 (defn- on-connect!
@@ -604,7 +502,7 @@
         (st/set-tail! state_ (- (m/utf16-length content) (m/utf16-length n))))
       (log-err (str "socket: doc rev " (:rev @state_))))
     (catch :default e
-      (log-err (str "socket: doc frame ignored: " (err-message e))))))
+      (log-err (str "socket: doc frame ignored: " (errors/err-message e))))))
 
 (defn- on-operation! [msg]
   (try
@@ -622,7 +520,7 @@
           (st/on-remote-operation! state_ {:rev (:rev msg) :new-content new-content} (now-ms))
           (st/set-tail! state_ (- (m/utf16-length new-raw) (m/utf16-length new-content))))))
     (catch :default e
-      (log-err (str "socket: remote op failed (" (err-message e) "); resyncing from /download"))
+      (log-err (str "socket: remote op failed (" (errors/err-message e) "); resyncing from /download"))
       (resync-from-download! "remote-op-failed"))))
 
 (defn- on-ack!
@@ -668,7 +566,7 @@
             (st/on-rebuild! state_ {:rev rev :new-content n} (now-ms))))
         (log-err (str "socket: force rebuild to rev " rev)))
       (catch :default e
-        (log-err (str "socket: force frame ignored: " (err-message e))))))
+        (log-err (str "socket: force frame ignored: " (errors/err-message e))))))
 
 (defn- on-info! [msg]
   (reset! last-info_ msg)
@@ -741,16 +639,46 @@
 ;; Each takes keywordized arguments, returns data or a Promise of data.
 ;; execute-tool wraps both into the MCP result envelope.
 
+(defn- checked-wait-ms [args]
+  (let [v (:waitMs args)]
+    (cond
+      (nil? v) 0
+      (and (.isInteger js/Number v) (>= v 0) (<= v 15000)) v
+      :else (throw (ex-info "bad arg waitMs: integer 0..15000 required"
+                            {:code :bad-args :field :waitMs :got v})))))
+
 (defn- handle-get-status [args]
-  (let [env @env_]
-    (require-state! env)
-    (tools/get-status env)))
+  (let [env @env_
+        wait-ms (checked-wait-ms args)
+        started ((:now-ms env))]
+    ;; A cold worker must not answer :not-booted here. Kick boot, then wait
+    ;; (or return at once for waitMs 0). The wait REPLACES require-state! for
+    ;; this handler: a timeout returns the nil-tolerant status, not an error.
+    (when (nil? @(:state env))
+      (when-not @booting_ (boot!)))
+    (if (zero? wait-ms)
+      (assoc (tools/get-status env) :waitedMs 0)
+      (-> (tools/wait-for-writable! env (+ started wait-ms)
+                                    (:now-ms env) (:sleep-ms env))
+          (.then (fn [_ok?]
+                   (assoc (tools/get-status env)
+                          :waitedMs (- ((:now-ms env)) started))))))))
+
+(defn- checked-level [args]
+  (let [v (:level args)]
+    (when (some? v)
+      (when (or (not (.isInteger js/Number v)) (< v 1) (> v 6))
+        (throw (ex-info "bad arg level: integer 1..6 required"
+                        {:code :bad-args :field :level :got v}))))
+    v))
 
 (defn- handle-read-section [args]
   (let [env @env_]
     (require-state! env)
     (tools/read-section env {:heading (checked-str args :heading)
-                             :occurrence (checked-occurrence args)})))
+                             :occurrence (checked-occurrence args)
+                             :level (checked-level args)
+                             :includeSubsections (true? (:includeSubsections args))})))
 
 (defn- handle-read-note [args]
   (let [env @env_
@@ -767,7 +695,8 @@
                                     {:code :bad-args :field :limit :got v}))))
                 v)]
     (require-state! env)
-    (tools/read-note env {:offset offset :limit limit})))
+    (tools/read-note env {:offset offset :limit limit
+                          :sections (:sections args)})))
 
 (defn- handle-replace-lines [args]
   (let [env @env_
@@ -781,6 +710,7 @@
     (connected-check! env)
     (tools/replace-lines env {:base-rev base-rev :base-hash base-hash
                               :edits edits
+                              :preview (:preview args)
                               :dryRun (boolean (:dryRun args))
                               :verify (if (contains? args :verify)
                                       (boolean (:verify args))
@@ -799,6 +729,7 @@
     (connected-check! env)
     (tools/insert-lines env {:base-rev base-rev :base-hash base-hash
                              :line line :text text
+                             :preview (:preview args)
                              :dryRun (boolean (:dryRun args))
                              :verify (if (contains? args :verify)
                                         (boolean (:verify args))
@@ -819,6 +750,7 @@
     (connected-check! env)
     (tools/delete-lines env {:base-rev base-rev :base-hash base-hash
                              :line line :count count
+                             :preview (:preview args)
                              :dryRun (boolean (:dryRun args))
                              :verify (if (contains? args :verify)
                                         (boolean (:verify args))
@@ -869,6 +801,7 @@
                                                       :got v})))
                                    v))
                 (:dryRun args) (assoc :dryRun (boolean (:dryRun args)))
+                (some? (:preview args)) (assoc :preview (:preview args))
                 (contains? args :verify) (assoc :verify (boolean (:verify args))))]
       (when has-text?
         (checked-str args :heading))
@@ -892,6 +825,7 @@
     (tools/append-to-section env {:heading heading :text text
                                   :base-rev base-rev :base-hash base-hash
                                   :occurrence occurrence
+                                  :preview (:preview args)
                                   :dryRun (boolean (:dryRun args))
                                   :verify (if (contains? args :verify)
                                              (boolean (:verify args))
@@ -947,7 +881,7 @@
 
 (defn- is-error-result [e]
   {:content [{:type "text"
-              :text (js/JSON.stringify (clj->js (err-map e)))}]
+              :text (js/JSON.stringify (clj->js (errors/err-map e)))}]
    :isError true})
 
 (def ^:private arg-aliases
@@ -998,10 +932,23 @@
                        :allowed (vec allowed)
                        :hint "remove the unknown keys or check tools/list"})))
     (doseq [[k v] args]
-      (when-let [t (get-in props [k :type])]
-        (when-not (value-matches-type? t v)
+      (let [spec (get props k)
+            t (:type spec)
+            allowed (:enum spec)]
+        (when (and t (not (value-matches-type? t v)))
           (throw (ex-info (str "bad arg " k ": " t " required")
-                          {:code :bad-args :field k :expected t :got v})))))))
+                          {:code :bad-args :field k :expected t :got v
+                           :allowed (some->> allowed vec)})))
+        (when (and allowed (not (some #(= % v) allowed)))
+          (throw (ex-info (str "bad arg " k ": one of "
+                               (str/join ", " allowed) " required")
+                          {:code :bad-args
+                           :field k
+                           :got v
+                           :allowed (vec allowed)
+                           :hint (if (and (= k "sections") (boolean? v))
+                                   "use \"none\" instead of a boolean"
+                                   (str "allowed: " (str/join ", " allowed)))})))))))
 
 (defn- execute-tool [handler args]
   (-> (js/Promise.resolve nil)
@@ -1013,7 +960,7 @@
                   (if (= :dry-run-preview (:code d))
                     (ok-result (dissoc d :code))
                     (do (when (instance? js/TypeError e)
-                          (.error js/console (str "internal: " (err-message e))))
+                          (.error js/console (str "internal: " (errors/err-message e))))
                         (is-error-result e))))))))
 
 ;; ---------------- JSON-RPC dispatch ----------------
@@ -1092,7 +1039,7 @@
           (reply-err nil -32600 "Invalid Request" {:reason "top-level JSON must be an object"})))
       (catch :default e
         (try
-          (reply-err nil -32700 "Parse error" {:message (err-message e)})
+          (reply-err nil -32700 "Parse error" {:message (errors/err-message e)})
           (catch :default _e nil))))))
 
 ;; ---------------- stdio loop + shutdown ----------------
@@ -1117,7 +1064,7 @@
     (.on js/process "SIGTERM" (fn [] (shutdown! 0)))
     (.on js/process "uncaughtException"
          (fn [e]
-           (log-err (str "hedgedoc-mcp: uncaught " (err-message e)))
+           (log-err (str "hedgedoc-mcp: uncaught " (errors/err-message e)))
            (shutdown! 1)))))
 
 ;; ---------------- boot ----------------
@@ -1141,14 +1088,14 @@
                      :on-disconnect (fn [info]
                                       (st/invalidate-rev! state_)
                                       (log-err (str "socket: disconnect "
-                                                    (err-message (:reason info))
+                                                    (errors/err-message (:reason info))
                                                     "; rev invalidated")))})
         (.then (fn [_s]
                  (log-err "socket: connected")
                  nil))
         (.catch (fn [e]
-                  (log-err (str "socket: connect failed: " (err-message e) " "
-                                (encode-msg (err-map e))))
+                  (log-err (str "socket: connect failed: " (errors/err-message e) " "
+                                (encode-msg (errors/err-map e))))
                   nil)))))
 
 (defn- boot-download!
@@ -1163,7 +1110,7 @@
                                " UTF-16 units)")))
                nil))
       (.catch (fn [e]
-                (log-err (str "boot: /download failed (" (err-message e)
+                (log-err (str "boot: /download failed (" (errors/err-message e)
                               "), attempt " (inc attempt)))
                 (when (< attempt 20)
                   (-> (sleep-p 3000)
@@ -1180,7 +1127,7 @@
         (.then (fn [] (boot-download! 0)))
         (.then (fn [] (connect-t!)))
         (.catch (fn [e]
-                  (log-err (str "boot failed: " (err-message e)))
+                  (log-err (str "boot failed: " (errors/err-message e)))
                   nil))
         (.finally (fn [] (reset! booting_ false))))))
 
@@ -1196,7 +1143,7 @@
                   " idle-ms=" (:idle-ms @cfg_)))
     (boot!)
     (catch :default e
-      (log-err (encode-msg {:fatal true :error (err-map e)}))
+      (log-err (encode-msg {:fatal true :error (errors/err-map e)}))
       (js/process.exit 1))))
 
 (main)

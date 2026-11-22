@@ -103,12 +103,26 @@ await rpc('initialize', { protocolVersion: '2024-11-05' });
 await new Promise(r => setTimeout(r, 7000));
 
 // ---------- baseline ----------
-let st = await call('get-status');
+let st = await call('get-status', { waitMs: 0 });
 const base = await call('read-note');
 const baseHash = st.hash, baseLines = base['total-lines'];
 const baseFull = base.content;
 assert(st.rev >= 0 && st.auth?.kind === 'user', 'not booted as a user');
 console.log(`baseline rev=${st.rev} lines=${baseLines} length=${base.length}`);
+
+// S0 get-status wait contract: waitMs 0 must not spend wall-clock, and a
+// ready worker reports writable instead of making the client poll.
+check('S0 get-status waitMs 0 reports writable without waiting', () => {
+  assert(st.writable === true, `writable expected true, got ${st.writable}`);
+  assert(st.waitedMs === 0, `waitedMs expected 0, got ${st.waitedMs}`);
+});
+const stWait = await call('get-status', { waitMs: 5000 });
+check('S0b get-status waitMs 5000 on a ready worker', () => {
+  assert(stWait.writable === true, `writable expected true, got ${stWait.writable}`);
+  assert(Number.isInteger(stWait.waitedMs) && stWait.waitedMs >= 0, `bad waitedMs: ${stWait.waitedMs}`);
+  assert(stWait.rev >= 0, 'rev not known after the wait');
+  assert(stWait.connected === true, 'not connected after the wait');
+});
 
 // S1
 check('S1 orientation', () => {
@@ -116,6 +130,66 @@ check('S1 orientation', () => {
   assert(base.content.startsWith('---'), 'front matter not visible');
   assert(base.sections.every(s => Number.isInteger(s.line) && s.line >= 1), 'sections lack line numbers');
   assert(base.length > 0, 'missing length');
+});
+
+// S1b subtree read: includeSubsections walks past child headings; the default
+// read still stops at the first child and must not grow the write marker.
+const secs = base.sections || [];
+const parentIdx = secs.findIndex((s, i) => s.level > 1 && secs[i + 1] && secs[i + 1].level > s.level);
+const subQ = parentIdx >= 0
+  ? { heading: secs[parentIdx].heading, level: secs[parentIdx].level,
+      occurrence: secs[parentIdx].occurrence, includeSubsections: true }
+  : null;
+const subRead = subQ ? await call('read-section', subQ) : null;
+const plainRead = subQ
+  ? await call('read-section', { heading: subQ.heading, level: subQ.level, occurrence: subQ.occurrence })
+  : null;
+check('S1b subtree read includes children; default read unchanged', () => {
+  assert(subQ && subRead, 'no section with a nested child heading found');
+  assert(subRead.writeRoundTrip === false, `writeRoundTrip=${subRead.writeRoundTrip}`);
+  assert(typeof subRead.hint === 'string' && subRead.hint.length > 0, 'no subtree hint');
+  assert(plainRead.writeRoundTrip === undefined, 'writeRoundTrip leaked into a default read');
+  assert(subRead.start === plainRead.start, 'subtree start moved');
+  assert(subRead.content.startsWith(plainRead.content), 'subtree must extend the default body');
+  assert(subRead.end >= plainRead.end, 'subtree end did not advance');
+  assert(subRead.content.includes(secs[parentIdx + 1].heading), 'child heading missing from subtree');
+});
+
+// S1c read-note section modes: "all" (default), "none", "window". The window
+// filter is by section start offset, so :line must stay an absolute document
+// line. get-status still lists every heading when read-note is asked for none;
+// that asymmetry is deliberate.
+const noneNote = await call('read-note', { sections: 'none' });
+const allNote = await call('read-note', { sections: 'all' });
+const windowHead = secs.length ? secs[Math.floor(secs.length / 3)] : null;
+const pageAll = windowHead ? await call('read-note', { offset: windowHead.line, limit: 8 }) : null;
+const pageWin = windowHead
+  ? await call('read-note', { offset: windowHead.line, limit: 8, sections: 'window' })
+  : null;
+check('S1c sections none returns [] and keeps size fields', () => {
+  assert(Array.isArray(noneNote.sections) && noneNote.sections.length === 0, 'none did not return []');
+  assert(noneNote.content === base.content, 'none changed content');
+  assert(noneNote.length === base.length && noneNote['total-lines'] === base['total-lines'],
+    'none changed length/total-lines');
+  assert((st.sections || []).length === secs.length && secs.length > 0,
+    'get-status stopped listing headings (asymmetry broken)');
+});
+check('S1c sections all is unchanged', () => {
+  assert(JSON.stringify(allNote.sections) === JSON.stringify(base.sections), 'all differs from default');
+});
+check('S1c sections window keeps only headings inside the slice', () => {
+  assert(pageAll && pageWin, 'no section to window on');
+  const expected = (base.sections || [])
+    .filter(s => s.line >= pageWin['start-line'] && s.line <= pageWin['end-line'])
+    .map(s => ({ level: s.level, heading: s.heading, occurrence: s.occurrence, line: s.line }));
+  assert(pageAll.sections.length === (base.sections || []).length, 'paginated default is not all');
+  assert(JSON.stringify(pageWin.sections) === JSON.stringify(expected),
+    `window mismatch: ${JSON.stringify(pageWin.sections)} vs ${JSON.stringify(expected)}`);
+  assert(pageWin.sections.every(s => Number.isInteger(s.line) && s.line >= 1), 'window lines are not absolute');
+  assert(pageWin.content === base.content.split('\n').slice(pageWin['start-line'] - 1, pageWin['end-line']).join('\n'),
+    'window changed content');
+  assert(pageWin.length === pageAll.length && pageWin['truncated'] === pageAll.truncated,
+    'window changed length/truncated');
 });
 
 // locate a distinctive line
@@ -129,6 +203,10 @@ const dryArgs = { 'base-rev': st.rev, 'base-hash': st.hash,
 const s2a = await call('replace-lines', { ...dryArgs, dryRun: true });
 const s2alias = await call('replace-lines', { ...dryArgs, 'dry-run': true });
 const s2legacy = await call('replace-lines', { ...dryArgs, 'dry-run?': true });
+const dryModes = {};
+for (const mode of ['window', 'region', 'tail']) {
+  dryModes[mode] = await call('replace-lines', { ...dryArgs, dryRun: true, preview: mode });
+}
 const s2b = await call('get-status');
 check('S2 dry-run never writes', () => {
   for (const [name, r] of [['dryRun', s2a], ['dry-run', s2alias], ['dry-run?', s2legacy]]) {
@@ -139,6 +217,36 @@ check('S2 dry-run never writes', () => {
   }
   assert(String(s2a.preview).includes(String(targetLine)), 'preview not localized');
   assert(s2b.rev === st.rev && s2b.hash === st.hash, 'dry-run changed state');
+});
+check('S2b preview modes: shape, affected line, nothing written', () => {
+  for (const mode of ['window', 'region', 'tail']) {
+    const r = dryModes[mode];
+    assert(r['preview-mode'] === mode, `mode ${r['preview-mode']} != ${mode}`);
+    assert(r.written === false && r['new-rev'] === undefined, `${mode} claims a write`);
+    assert(Number.isInteger(r['preview-total-lines']) && r['preview-total-lines'] >= 1,
+      `${mode} preview-total-lines=${r['preview-total-lines']}`);
+    assert(r['preview-lines'] && Number.isInteger(r['preview-lines']['start-line'])
+      && Number.isInteger(r['preview-lines']['end-line']), `${mode} preview-lines bad`);
+    assert(typeof r['preview-truncated'] === 'boolean', `${mode} preview-truncated missing`);
+    assert(String(r.preview).includes(targetText + ' [dry]'), `${mode} preview missed the edit`);
+    assert(r.preview.split('\n').length <= 200, `${mode} preview exceeded 200 lines`);
+  }
+});
+// append-to-section resolves to a suffix ending at doc end, but its preview
+// must be the inserted block only (affected-span), not the tail of the note.
+const apSec = (secs || []).find(s => s.level >= 2) || (secs || [])[0];
+const apDry = apSec ? await call('append-to-section', {
+  'base-rev': st.rev, 'base-hash': st.hash, heading: apSec.heading,
+  occurrence: apSec.occurrence, text: 'PREVIEW-DRY-ONLY', dryRun: true, preview: 'region',
+}) : null;
+check('S2c append dry-run previews its own block', () => {
+  assert(apDry, 'no section to append to');
+  assert(apDry['dry-run'] === true && apDry.written === false, 'append dry-run wrote');
+  assert(apDry['new-rev'] === undefined, 'append dry-run leaked new-rev');
+  assert(apDry['preview-mode'] === 'region', `mode ${apDry['preview-mode']}`);
+  assert(String(apDry.preview).includes('PREVIEW-DRY-ONLY'), 'append preview missed the block');
+  assert(apDry['preview-total-lines'] <= 3,
+    `append preview spanned ${apDry['preview-total-lines']} lines (note-end suffix?)`);
 });
 
 // S3 single-line edit + revert
@@ -192,6 +300,10 @@ const rewrite = `${sec.content.trim()}\n\n+ Rehearsal rewrite line.\n`;
 console.error('  rev before S5:', st.rev);
 const dry5 = await call('apply-ops', { 'base-rev': st.rev, 'base-hash': st.hash,
   heading: secName, 'new-section-text': rewrite, dryRun: true });
+const dry5region = await call('apply-ops', { 'base-rev': st.rev, 'base-hash': st.hash,
+  heading: secName, 'new-section-text': rewrite, dryRun: true, preview: 'region' });
+const dry5tail = await call('apply-ops', { 'base-rev': st.rev, 'base-hash': st.hash,
+  heading: secName, 'new-section-text': rewrite, dryRun: true, preview: 'tail' });
 st = await call('get-status');
 const w5 = await write('apply-ops', st => ({ 'base-rev': st.rev, 'base-hash': st.hash,
   heading: secName, 'new-section-text': rewrite }), c => c.includes('Rehearsal rewrite line.'));
@@ -203,6 +315,15 @@ const back5 = await call('read-section', { heading: secName });
 check('S5 section rewrite + restore', () => {
   assert(dry5['dry-run'] === true && dry5.written === false, 'bad dry-run flag/state');
   assert(dry5['new-rev'] === undefined, 'dry-run leaked new-rev');
+  for (const [mode, r] of [['region', dry5region], ['tail', dry5tail]]) {
+    assert(r['preview-mode'] === mode, `${mode} mode ${r['preview-mode']}`);
+    assert(r.written === false && r['new-rev'] === undefined, `${mode} dry-run wrote`);
+    assert(String(r.preview).includes('Rehearsal rewrite line.'),
+      `${mode} preview missed the end of the replacement`);
+    assert(r['preview-total-lines'] > 1, `${mode} total-lines ${r['preview-total-lines']}`);
+  }
+  assert(dry5tail['preview-truncated'] === true || dry5tail.preview.split('\n').length <= 12,
+    'tail is not bounded');
   assert(['download-poll', 'ack'].includes(w5.verified), 'rewrite not verified: ' + JSON.stringify(w5));
   assert(after5.content.includes('Rehearsal rewrite line.'), 'rewrite not visible');
   assert(norm(back5.content) === norm(secContent), 'section not restored');

@@ -1,4 +1,4 @@
-# Agent scenario suite — real edits on a disposable copy
+# Agent scenario suite: real edits on a disposable copy
 
 Purpose: a fresh agent can prove the MCP still does real editorial work after
 any change. Run it against a **disposable instance**, never production. Every scenario is
@@ -35,53 +35,60 @@ that can edit the note. A source episode to copy (e.g. `<source-note-id>`).
 Each step states the expected result. Anything else is a failure; report the
 tool result verbatim.
 
-**S1 — orientation.** `get-status` (rev ≥ 0, auth kind "user", sections > 0);
+**S1: orientation.** `get-status` (rev ≥ 0, auth kind "user", sections > 0);
 `read-note` with no args (front matter visible, heading list carries line
 numbers, `length` > 0); `read-section` on one heading (start/end integers).
 Fail if front matter is invisible or sections have no line numbers.
 
-**S2 — dry-run never writes.** Pick a distinctive line. `replace-lines` with
-`:dry-run? true`. Expect `dry-run: true`, a numbered preview window around the
-target line (not the first 2 KB), and **no change** to rev or hash. Re-read
-`get-status` to prove it.
+**S2: dry-run never writes.** Pick a distinctive line. `replace-lines` with
+`dryRun: true`. Expect `dry-run: true`, `written: false`, a numbered preview
+around the target line (not the first 2 KB), and **no change** to rev or hash.
+Repeat with `preview: "region"` and `preview: "tail"`; `preview-mode` must echo
+the requested mode, `preview-total-lines` must report the affected range, and
+`preview` must stop at 200 lines or 4000 UTF-16 units with `preview-truncated`
+set. Re-read `get-status` after each mode to prove nothing was written.
 
-**S3 — single-line edit.** `replace-lines` on that line (append a marker),
+**S3: single-line edit.** `replace-lines` on that line (append a marker),
 then `read-section` the section: marker present. Revert with another
 `replace-lines`; marker gone. Both writes must report `verified`
 (`download-poll` or `ack`), not `emitted`.
 
-**S4 — batch line edit.** Change four consecutive/related lines in one call
+**S4: batch line edit.** Change four consecutive/related lines in one call
 (e.g. grammar fixes). Expect one write, preview showing all target lines, and
 all four changes present. Revert as one batch.
 
-**S5 — section rewrite.** `read-section <heading>` capture. `apply-ops` with
-`heading` + `new-section-text` (dry-run first: preview near the section, no
-write). Apply, assert the new text, then restore with `new-section-text` using
-the captured content. Restored content must equal the capture after trimming.
+**S5: section rewrite.** `read-section <heading>` without `includeSubsections`
+and capture the body. A subtree read is not a write source: it returns
+`writeRoundTrip: false` because section writes still cover the body only, so do
+not feed that content into `new-section-text`. `apply-ops` with `heading` +
+`new-section-text` (dry-run first with `preview: "region"`, then `"tail"`; the
+last line of the replacement must appear in both, and nothing is written).
+Apply, assert the new text, then restore with `new-section-text` using the
+captured content. Restored content must equal the capture after trimming.
 
-**S6 — appended block.** `read-section <heading>` capture. `append-to-section`
+**S6: appended block.** `read-section <heading>` capture. `append-to-section`
 a multi-line block (a pick or a feedback quote). Assert the block landed at the
 section end **and that a blank line still separates it from the next heading**
 (the bug that shipped once). Restore with `new-section-text`; content equals
 capture after trimming.
 
-**S7 — stale write.** Using a rev at least 3 behind, `replace-lines` with the
+**S7: stale write.** Using a rev at least 3 behind, `replace-lines` with the
 current hash. Expect `stale-revision` with `server-rev`/`server-hash` and a
 hint. Then re-read and perform the same edit successfully.
 
-**S8 — line mismatch.** Current rev/hash, but `:old` deliberately wrong.
+**S8: line mismatch.** Current rev/hash, but `:old` deliberately wrong.
 Expect `line-mismatch` with `:line`, `:expected`, `:actual` and a hint. No
 write must occur.
 
-**S9 — insert / search / delete.** `insert-lines` a marker at the end of the
+**S9: insert / search / delete.** `insert-lines` a marker at the end of the
 note; `search` must find exactly that line; `delete-lines` it; `search` must
 return nothing. All with one attempt (no retries).
 
-**S10 — integrity.** Full-document content must be back to the baseline after
+**S10: integrity.** Full-document content must be back to the baseline after
 normalizing blank lines (diff non-blank lines only). Fence parity unchanged
 (count ``` lines, must be even). `total-lines` within ±2 of baseline.
 
-**S11 — concurrency (optional, needs a second client).** A human edit lands
+**S11: concurrency (optional, needs a second client).** A human edit lands
 between your read and write (e.g. `curl` a socket op, or a second MCP). Expect
 `stale-revision`; retry once with the fresh base and succeed. If no second
 client is available, skip and say so.
@@ -115,6 +122,11 @@ delete it in the web UI when you are done.
   (HTTP 429). Restart the app container to clear it, and do not loop logins.
 - **Strict runs.** `WRITE_ATTEMPTS=1` disables the harness retry so a pass
   means one clean attempt per operation. Use it as the gate.
+- **Boot and retry.** `get-status` accepts `waitMs` up to 15000, and `writable`
+  is false until the worker has a revision and a live socket. `not-connected`
+  carries `retryable: true` and `retryAfterMs: 1000`; `stale-revision` and
+  `rev-unknown` do not, because they need a fresh read. `applied-but-unconfirmed`
+  is a result with `retryable: false`, not an error.
 - **Transport.** `HEDGEDOC_TRANSPORTS` selects the engine.io transports
   (default `websocket`; `polling` or `websocket,polling` also work). Both have
   shown heartbeat drops in this environment (`ping timeout` / `transport
@@ -129,6 +141,6 @@ delete it in the web UI when you are done.
 - Restoring a section through `:new-section-text` can normalize one leading
   blank line; compare after trimming.
 - If the app restarts mid-run the note rev resets to 0; that is a server
-  restart, not an adapter bug — note it and rerun.
+  restart, not an adapter bug; note it and rerun.
 - The adapter refuses writes when the session is a guest; `get-status.auth`
   tells you which kind you have.

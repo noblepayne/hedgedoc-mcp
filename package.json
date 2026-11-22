@@ -11,11 +11,11 @@
     "dev:up": "podman-compose -f dev/compose.yml up -d",
     "dev:seed": "node dev/seed.mjs",
     "dev:down": "podman-compose -f dev/compose.yml down -v",
-    "test:pbt": "cd test && node pbt-1-gens.mjs && node pbt-2-transform.mjs --runs 1000 && node pbt-3-invariants.mjs && node pbt-4-replace-lines.mjs",
+    "test:pbt": "cd test && node pbt-1-gens.mjs && node pbt-2-transform.mjs --runs 1000 && node pbt-3-invariants.mjs && node pbt-4-replace-lines.mjs && node error-shape.mjs && node model-subtree.mjs && node affected-span.mjs",
     "prepack": "npm run build"
   },
   "type": "module",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "devDependencies": {
     "fast-check": "^4.10.2"
   },

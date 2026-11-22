@@ -29,18 +29,47 @@ const wait = (id, ms = 10000) => new Promise((res, rej) => {
 });
 let failed = false;
 const check = (ok, msg) => { console.log(`${ok ? 'PASS' : 'FAIL'} ${msg}`); if (!ok) failed = true; };
-const call = async (id, args) => {
-  send({ jsonrpc: '2.0', id, method: 'tools/call', params: { name: 'replace-lines', arguments: args } });
+const call = async (id, tool, args) => {
+  send({ jsonrpc: '2.0', id, method: 'tools/call', params: { name: tool, arguments: args } });
   const r = await wait(id);
   try { return JSON.parse(r.result.content[0].text); } catch { return {}; }
 };
 try {
   send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05' } });
   await wait(1);
-  const unknown = await call(2, { 'base-rev': 0, 'base-hash': 'x', bogus: true });
+  const unknown = await call(2, 'replace-lines', { 'base-rev': 0, 'base-hash': 'x', bogus: true });
   check(unknown.code === 'bad-args' && Array.isArray(unknown.data?.unknown), `unknown key is bad-args (${unknown.code})`);
-  const wrongType = await call(3, { 'base-rev': 0, 'base-hash': 'x', dryRun: 'true', edits: [{ line: 1, old: 'a', new: 'b' }] });
+  const wrongType = await call(3, 'replace-lines', { 'base-rev': 0, 'base-hash': 'x', dryRun: 'true', edits: [{ line: 1, old: 'a', new: 'b' }] });
   check(wrongType.code === 'bad-args' && wrongType.data?.expected === 'boolean', `stringified dryRun is rejected (${wrongType.code})`);
+  // Enum validation: read-note sections is enum-only (no :type), so the enum
+  // layer owns the rejection shape, including the hint for the dropped boolean.
+  const badEnum = await call(4, 'read-note', { sections: 'bogus' });
+  check(badEnum.code === 'bad-args' && badEnum.data?.field === 'sections'
+    && badEnum.data?.got === 'bogus' && Array.isArray(badEnum.data?.allowed)
+    && badEnum.data.allowed.includes('none'),
+    `invalid sections enum is bad-args with field/got/allowed (${badEnum.code})`);
+  const boolFalse = await call(5, 'read-note', { sections: false });
+  check(boolFalse.code === 'bad-args' && boolFalse.data?.field === 'sections'
+    && /none/.test(boolFalse.data?.hint || ''),
+    `boolean sections rejected with a "none" hint (${boolFalse.code})`);
+  // A valid enum must clear validation and reach the handler (which fails
+  // offline with not-connected/not-booted, never bad-args).
+  const okEnum = await call(6, 'read-note', { sections: 'none' });
+  check(okEnum.code !== 'bad-args', `valid sections enum clears validation (${okEnum.code})`);
+  // preview is enum-only too, and only on the five dry-run write tools.
+  const badPreview = await call(7, 'replace-lines', {
+    'base-rev': 0, 'base-hash': 'x',
+    edits: [{ line: 1, old: 'a', new: 'b' }], preview: 'bogus',
+  });
+  check(badPreview.code === 'bad-args' && badPreview.data?.field === 'preview'
+    && badPreview.data?.got === 'bogus' && Array.isArray(badPreview.data?.allowed)
+    && badPreview.data.allowed.includes('tail'),
+    `invalid preview enum is bad-args with field/got/allowed (${badPreview.code})`);
+  const okPreview = await call(8, 'replace-lines', {
+    'base-rev': 0, 'base-hash': 'x',
+    edits: [{ line: 1, old: 'a', new: 'b' }], preview: 'region',
+  });
+  check(okPreview.code !== 'bad-args', `valid preview enum clears validation (${okPreview.code})`);
 } catch (e) {
   check(false, String(e));
 } finally {
