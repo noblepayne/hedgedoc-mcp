@@ -4,11 +4,15 @@
 
 (def tool-defs
   [{:name "get-status"
-    :description "Server state: rev, content hash, snapshot id, section list, remote-idle-ms, rev-velocity (revs/min, trailing 60s), connected, writable, auth. waitMs waits up to that many ms for boot to land, then returns the status with waitedMs. Read-only."
+    :description "Server state: rev, content hash, snapshot id, section list, remote-idle-ms, rev-velocity (revs/min, trailing 60s), connected, writable, auth, plus worker (pid, version, noteId, startedAt, logGeneration) and socket (connected, lastDisconnectReason, lastConnectError, lastConnectAt, lastDisconnectAt, reconnectAttempts, nextAttemptAt, generation). waitMs waits up to that many ms for boot to land (and triggers a throttled reconnect while disconnected), then returns the status with waitedMs. forceReconnect disposes the socket and reconnects now; it refuses with force-reconnect-blocked while a write is in flight. Read-only."
     :inputSchema {:type "object"
                   :properties {:waitMs {:type "integer" :minimum 0 :maximum 15000
-                                        :default 0}}
+                                        :default 0}
+                               :forceReconnect {:type "boolean" :default false}}
                   :additionalProperties false}}
+   {:name "doctor"
+    :description "Read-only health report, multi mode only (core refuses with doctor-requires-supervisor). Server /status and version, one entry per worker (socket state, rev, hash, writable, last error), the heartbeat registry rows with PIDs, duplicate note ids across live processes, and old-working-tree versus Nix version mismatches. Each worker query is capped at 5s; a wedged worker reports status \"timeout\" instead of hanging. Takes no arguments and no note-id. Never kills or reaps anything: act on the reported PIDs yourself."
+    :inputSchema {:type "object" :properties {} :additionalProperties false}}
    {:name "read-section"
     :description "Scoped read of one section by heading (case/space-insensitive anchor; :occurrence selects among duplicates; :level 1..6 filters to that heading level with no fallback). includeSubsections reads from after the heading line to the next heading at or above that level and returns writeRoundTrip true plus the echoed fields (heading, level, occurrence, includeSubsections; no nested anchor object) so the slice can be written back: pass includeSubsections true to apply-ops with new-section-text, or to append-to-section. The heading line is always preserved. Returns rev, hash, content slice, UTF-16 offsets. Read-only."
     :inputSchema {:type "object"

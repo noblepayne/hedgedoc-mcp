@@ -85,6 +85,9 @@
    "unknown-tool"
    "No such tool; call tools/list."
 
+   "doctor-requires-supervisor"
+   "doctor is a multi-mode tool: run the supervisor (hedgedoc-mcp multi) and call doctor there; a single-note core has no worker registry to report."
+
    "line-mismatch"
    "A :old line does not match the document. Re-read (read-note/read-section) and fix the edit."
 

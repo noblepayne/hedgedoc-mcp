@@ -38,6 +38,7 @@
             [hedgedoc-mcp.errors :as errors]
             [hedgedoc-mcp.model :as m]
             [hedgedoc-mcp.model-ops :as ops]
+            [hedgedoc-mcp.registry :as registry]
             [hedgedoc-mcp.state :as st]
             [hedgedoc-mcp.tools :as tools]
             [hedgedoc-mcp.transport :as t]
@@ -48,7 +49,7 @@
 ;; ---------------- constants ----------------
 
 (def server-name "hedgedoc-mcp")
-(def server-version "0.2.3")
+(def server-version "0.2.4")
 (def mcp-protocol-version "2024-11-05")
 
 (def default-idle-ms 30000)
@@ -87,8 +88,32 @@
 ;; loop forever at boot.
 (defonce session-refresh-count_ (atom 0))
 
+;; ---- reconnect loop state (P3-00a) ----
+;; Core owns the only loop; socket.io reconnection is off. A connection
+;; generation identifies which socket may mutate state. attempt counts are
+;; consecutive failures reset on connect.
+(defonce conn-gen_ (atom 0))
+(defonce reconnect-attempts_ (atom 0))
+(defonce reconnect-timer_ (atom nil))
+(defonce reconnect-inflight_ (atom nil))
+(defonce last-connect-error_ (atom nil))
+(defonce last-disconnect_ (atom nil))
+(defonce last-connect-at_ (atom nil))
+(defonce last-attempt-at_ (atom nil))
+(defonce next-attempt-at_ (atom nil))
+(defonce last-trigger-at_ (atom nil))
+
+;; ---- diagnostics (P3-00b) ----
+;; The heartbeat registry carries socket state for the supervisor; started-at
+;; and the timer are process facts, not worker state.
+(defonce started-at_ (atom nil))
+(defonce heartbeat-timer_ (atom nil))
+(def heartbeat-interval-ms 10000)
+
 (declare boot!)
 (declare connect-t!)
+(declare ensure-connected!)
+(declare write-heartbeat!)
 
 ;; ---------------- config ----------------
 
@@ -264,9 +289,9 @@
 (defn- has-credentials? []
   (and (some? (:email @cfg_)) (some? (:password @cfg_))))
 
-(defn- login!
-  "POST /login with the configured credentials and adopt the session cookie.
-   Never log the password or the email."
+(defn- login-once!
+  "One POST /login. A 5xx is a transient boot response, not a session: do not
+   adopt its cookie. Returns {:ok boolean :status n}."
   []
   (let [cfg @cfg_
         params (js/URLSearchParams.)]
@@ -278,20 +303,47 @@
                        :headers #js {:Content-Type "application/x-www-form-urlencoded"}
                        :body (.toString params)})
         (.then (fn [res]
-                 (capture-cookie! res true)
-                 (log-err (str "login: HTTP " (.-status res)
-                               " cookie " (if (some? @cookie_) "adopted" "missing")))
-                 nil))
+                 (let [status (.-status res)
+                       ok? (and (>= status 200) (< status 400))]
+                   (if ok?
+                     (capture-cookie! res true)
+                     (log-err (str "login: HTTP " status
+                                   "; not adopting a non-session cookie")))
+                   (log-err (str "login: HTTP " status
+                                 " cookie " (if (some? @cookie_) "adopted" "missing")))
+                   {:ok ok? :status status})))
         (.catch (fn [e]
                   (log-err (str "login: failed (" (errors/err-message e) ")"))
-                  nil))
-        (.then (fn [_]
-                 (-> (check-auth!)
-                     (.then (fn [_]
-                              (when (not= :user (:kind @auth_))
-                                (log-err (str "login: failed (session is guest; "
-                                              "check HEDGEDOC_EMAIL / HEDGEDOC_PASSWORD)")))
-                              nil))))))))
+                  {:ok false :status nil})))))
+
+(defn- login!
+  "Log in with bounded retries. A HedgeDoc restart can answer 503 while it
+   boots; retrying is what keeps a reconnect from latching onto a guest
+   session. Never log the password or the email."
+  []
+  (letfn [(step [attempt]
+            (-> (login-once!)
+                (.then (fn [r]
+                         (if (:ok r)
+                           (-> (check-auth!)
+                               (.then (fn [_]
+                                        (if (and (not= :user (:kind @auth_))
+                                                 (< attempt 2))
+                                          (-> (sleep-p (* 1000 (inc attempt)))
+                                              (.then (fn [_] (step (inc attempt)))))
+                                          (do
+                                            (when (not= :user (:kind @auth_))
+                                              (log-err (str "login: failed (session is guest; "
+                                                            "check HEDGEDOC_EMAIL / HEDGEDOC_PASSWORD)")))
+                                            nil)))))
+                           (if (< attempt 2)
+                             (-> (sleep-p (* 1000 (inc attempt)))
+                                 (.then (fn [_] (step (inc attempt)))))
+                             (do
+                               (log-err (str "login: gave up after " (inc attempt)
+                                             " attempts (HTTP " (:status r) ")"))
+                               nil)))))))]
+    (step 0)))
 
 (defn- refresh-session!
   "One place to recover a dead session: re-login when credentials exist,
@@ -318,6 +370,107 @@
       (reset! state_ (st/make-initial (:note-id @cfg_) -1 n (now-ms)))
       (st/set-tail! state_ (- (m/utf16-length content) (m/utf16-length n))))))
 
+;; ---------------- reconnect loop (core owns it; socket.io reconnection off) ----------------
+;; Only schedule-reconnect!'s timer (and boot!'s initial connect) calls
+;; connect-t!. on-connect-error! and resync-from-download! record a need and
+;; schedule; they never open a socket themselves. Every timer and socket
+;; callback carries the generation it was created under and no-ops when that
+;; generation is stale, so a replaced socket cannot revive state.
+
+(defn- jitter-ms
+  "Full jitter in [d/2, d]: spreads a reconnect storm without shortening the
+   schedule. Injected into m/backoff-ms so the bare schedule stays testable."
+  [d]
+  (+ (quot d 2) (rand-int* (inc (quot d 2)))))
+
+(defn- clear-reconnect-timer! []
+  (when-let [t @reconnect-timer_]
+    (try (js/clearTimeout t) (catch :default _e nil)))
+  (reset! reconnect-timer_ nil))
+
+(defn- schedule-reconnect!
+  "Arms the single reconnect timer for generation gen."
+  [gen]
+  (when (and (not @shut_) (not (m/gen-stale? gen @conn-gen_)))
+    (clear-reconnect-timer!)
+    (let [delay (m/backoff-ms @reconnect-attempts_ jitter-ms)
+          at (+ (now-ms) delay)]
+      (swap! reconnect-attempts_ inc)
+      (reset! next-attempt-at_ at)
+      (log-err (str "socket: reconnect armed gen=" gen " attempt="
+                    (dec @reconnect-attempts_) " delay=" delay))
+      (reset! reconnect-timer_
+              (js/setTimeout
+               (fn []
+                 (reset! reconnect-timer_ nil)
+                 (when (and (not @shut_) (not (m/gen-stale? gen @conn-gen_)))
+                   (connect-t!)))
+               delay))
+      nil)))
+
+(defn- request-reconnect!
+  "Record a reconnect need and arm the loop for the current generation."
+  [why]
+  (log-err (str "socket: reconnect requested (" why ")"))
+  (schedule-reconnect! @conn-gen_)
+  nil)
+
+(defn- ensure-connected!
+  "Throttled reconnect trigger for get-status waits and retry-after-reconnect!.
+   Fires only while disconnected, with no connect pending, and at most once per
+   second (or immediately when the armed timer is due), so the 100 ms poll in
+   tools/wait-for-writable! cannot arm a reconnect per iteration."
+  []
+  (let [now (now-ms)
+        next-at @next-attempt-at_
+        last @last-trigger-at_]
+    (when (and (not @shut_)
+               (not (t/connected?))
+               (nil? @reconnect-inflight_)
+               (or (and (some? next-at) (<= next-at now))
+                   (and (nil? @reconnect-timer_)
+                        (or (nil? last) (>= (- now last) 1000)))))
+      (reset! last-trigger-at_ now)
+      (log-err (str "socket: reconnect triggered by status/wait gen=" @conn-gen_
+                    " pending=" (some? @reconnect-inflight_)))
+      (connect-t!)))
+  nil)
+
+(defn- force-reconnect!
+  "Dispose the live socket and reconnect now. Disposing mid-write would orphan
+   the op ack, so it refuses while inflight_ is set and never clears inflight_
+   itself: only a doc frame may resolve an intent."
+  []
+  (if-let [reason (m/force-reconnect-block @inflight_ @shut_)]
+    (throw (ex-info (str "forceReconnect refused: " (str reason))
+                    {:code :force-reconnect-blocked
+                     :reason (str reason)
+                     :hint "wait for the in-flight write to settle (get-status) and re-read; never re-emit"}))
+    (do
+      (clear-reconnect-timer!)
+      (log-err "socket: forceReconnect disposing the socket")
+      (try (t/disconnect!) (catch :default _e nil))
+      ;; disconnect! removes the listeners, so on-disconnect! will not fire:
+      ;; the disposed socket's rev is invalid now, not after the next frame.
+      (when (some? @state_) (st/invalidate-rev! state_))
+      (reset! reconnect-attempts_ 0)
+      (reset! next-attempt-at_ nil)
+      (write-heartbeat!)
+      (connect-t!))))
+
+(defn- on-disconnect!
+  "The current generation's socket dropped. Invalidate the rev, record why,
+   and arm one reconnect unless shutting down."
+  [gen info]
+  (when-not (m/gen-stale? gen @conn-gen_)
+    (let [reason (errors/err-message (:reason info))]
+      (when (some? @state_) (st/invalidate-rev! state_))
+      (reset! last-disconnect_ {:reason reason :at (now-ms)})
+      (log-err (str "socket: disconnect " reason "; rev invalidated"))
+      (write-heartbeat!)
+      (schedule-reconnect! gen)))
+  nil)
+
 (defn- resync-from-download! [why]
   (let [had-state (some? @state_)]
     (-> (fetch-download)
@@ -333,8 +486,9 @@
                                            (m/utf16-length n))))
                  (log-err (str "resync (" why "): state now rev " (:rev @state_)))
                  (when (and had-state (t/connected?) (not= why "socket-connect"))
-                   (log-err "resync: reconnecting for a doc frame")
-                   (connect-t!))
+                   ;; Schedule through the loop; a direct connect here would
+                   ;; race the timer and could revive a replaced generation.
+                   (request-reconnect! "resync"))
                  nil))
         (.catch (fn [e]
                   ;; A failed resync must not leave a stale rev usable: the
@@ -342,38 +496,141 @@
                   ;; hash. -1 forces a doc frame before the next write.
                   (when (some? @state_) (st/invalidate-rev! state_))
                   (log-err (str "resync (" why ") failed: " (errors/err-message e)))
-                  (when (t/connected?) (connect-t!))
+                  (when (t/connected?) (request-reconnect! "resync-failed"))
                   nil)))))
 
 (defn- on-connect-error!
   "A stale/invalid session cookie kills the room join with a plain error.
-   Drop it, adopt a fresh one from /download, and reconnect (bounded)."
-  [err]
-  (let [msg (str/lower-case (str (errors/err-message err)))]
-    (log-err (str "socket: connect_error " (errors/err-message err)))
-    (when (and (or (str/includes? msg "cookie is invalid")
-                   (str/includes? msg "auth failed"))
+   Drop it, adopt a fresh one from /download, and schedule the single loop.
+   Never opens a socket itself."
+  [gen err]
+  (when-not (m/gen-stale? gen @conn-gen_)
+    (let [msg (str/lower-case (str (errors/err-message err)))
+          auth? (or (str/includes? msg "cookie is invalid")
+                    (str/includes? msg "auth failed"))]
+      (log-err (str "socket: connect_error " (errors/err-message err)))
+      (reset! last-connect-error_ {:message (errors/err-message err) :at (now-ms)})
+      ;; The server answered, so the outage is over. Do not keep an auth
+      ;; error on the long network backoff; refresh and retry quickly.
+      (when auth? (reset! reconnect-attempts_ 0))
+      (if (and auth?
                (not @cookie-refresh-in-flight_)
                (< @cookie-refresh-count_ 3))
-      (reset! cookie-refresh-in-flight_ true)
-      (log-err "socket: refreshing session after auth failure")
-      (-> (refresh-session! "socket-auth")
-          (.then (fn [_]
-                   (swap! cookie-refresh-count_ inc)
-                   (connect-t!)))
-          (.catch (fn [e]
-                    (log-err (str "socket: cookie refresh failed ("
-                                  (errors/err-message e) ")"))))
-          (.finally (fn [] (reset! cookie-refresh-in-flight_ false)))))))
+        (do
+          (reset! cookie-refresh-in-flight_ true)
+          (log-err "socket: refreshing session after auth failure")
+          (-> (refresh-session! "socket-auth")
+              (.then (fn [_]
+                       (swap! cookie-refresh-count_ inc)
+                       (reset! reconnect-attempts_ 0)
+                       (request-reconnect! "socket-auth")))
+              (.catch (fn [e]
+                        (log-err (str "socket: cookie refresh failed ("
+                                      (errors/err-message e) ")"))
+                        (request-reconnect! "cookie-refresh-failed")))
+              (.finally (fn [] (reset! cookie-refresh-in-flight_ false)))))
+        (schedule-reconnect! gen))))
+  nil)
 
 (defn- on-connect!
-  "Fires on first connect and after every socket.io reconnect. Re-verify the
-   session (cookies rotate/expire) and recover state if we have none."
-  [_frame]
+  "Fires on every connect, including after a reconnect. Reset the backoff,
+   record the time, clear the retry timer, re-verify the session (cookies
+   rotate/expire), and recover state if we have none."
+  [_gen _frame]
   (log-err "socket: connect")
+  (reset! reconnect-attempts_ 0)
+  (reset! last-connect-at_ (now-ms))
+  (reset! next-attempt-at_ nil)
+  (clear-reconnect-timer!)
+  (write-heartbeat!)
   (check-auth!)
   (when (nil? @state_)
     (resync-from-download! "socket-connect"))
+  nil)
+
+;; ---------------- diagnostics: worker + socket (P3-00b) ----------------
+;; get-status carries both objects; the heartbeat registry carries the same
+;; socket state for a supervisor that cannot import this process.
+
+(defn- log-generation
+  "Change-log generation. Track B puts :log-generation in worker state; until
+   then the answer is 0, so the field never disappears from the shape."
+  []
+  (let [v @state_]
+    (if (some? v) (or (:log-generation v) 0) 0)))
+
+(defn- worker-info []
+  {:pid (.-pid js/process)
+   :version server-version
+   :noteId (:note-id @cfg_)
+   :startedAt @started-at_
+   :logGeneration (log-generation)})
+
+(defn- socket-info []
+  (let [d @last-disconnect_
+        e @last-connect-error_]
+    {:connected (boolean (t/connected?))
+     :lastDisconnectReason (when (some? d) (:reason d))
+     :lastDisconnectAt (when (some? d) (:at d))
+     :lastConnectError (when (some? e) (:message e))
+     :lastConnectErrorAt (when (some? e) (:at e))
+     :lastConnectAt @last-connect-at_
+     :reconnectAttempts @reconnect-attempts_
+     :nextAttemptAt @next-attempt-at_
+     :generation @conn-gen_}))
+
+(defn- diagnostics []
+  {:worker (worker-info) :socket (socket-info)})
+
+(defn- status-snapshot
+  "tools/get-status plus diagnostics. The single shaper for every branch of
+   handle-get-status (plain, waited, forceReconnect), so the shape cannot
+   drift between branches."
+  []
+  (write-heartbeat!)
+  (merge (tools/get-status @env_) (diagnostics)))
+
+;; ---- heartbeat registry (read by multi for list-notes and doctor) ----
+
+(defn- heartbeat-object []
+  (let [d @last-disconnect_]
+    {"pid" (.-pid js/process)
+     "note" (:note-id @cfg_)
+     "version" server-version
+     "script" (or (aget (.-argv js/process) 1) "")
+     "startedAt" @started-at_
+     "lastHeartbeat" (now-ms)
+     "connected" (boolean (t/connected?))
+     "writable" (boolean (and (some? @env_) (tools/writable? @env_)))
+     "rev" (if (some? @state_) (:rev @state_) -1)
+     "attempts" @reconnect-attempts_
+     "lastConnectAt" @last-connect-at_
+     "lastDisconnectAt" (when (some? d) (:at d))}))
+
+(defn- write-heartbeat!
+  "Best effort: a registry failure must never break boot or the write path."
+  []
+  (try (registry/write-entry! (heartbeat-object))
+       (catch :default _e nil))
+  nil)
+
+(defn- start-heartbeat! []
+  (write-heartbeat!)
+  (when (some? @heartbeat-timer_)
+    (js/clearInterval @heartbeat-timer_))
+  (let [t (js/setInterval (fn [] (write-heartbeat!)) heartbeat-interval-ms)]
+    ;; Never hold the process open for a heartbeat.
+    (when (some? (.-unref t)) (.unref t))
+    (reset! heartbeat-timer_ t))
+  nil)
+
+(defn- stop-heartbeat! []
+  (when (some? @heartbeat-timer_)
+    (js/clearInterval @heartbeat-timer_)
+    (reset! heartbeat-timer_ nil))
+  (when (some? @cfg_)
+    (try (registry/remove-entry! (:note-id @cfg_) (.-pid js/process))
+         (catch :default _e nil)))
   nil)
 
 ;; ---------------- op format conversion ----------------
@@ -483,7 +740,7 @@
 
 ;; ---------------- transport callbacks -> state transitions ----------------
 
-(defn- on-doc! [frame]
+(defn- on-doc! [gen frame]
   (try
     (let [rev (:rev frame) content (:content frame) clients (:clients frame)]
       (when (or (not (.isInteger js/Number rev)) (not (string? content)))
@@ -491,20 +748,32 @@
       (reset! cookie-refresh-count_ 0)
       (swap! presence_ (fn [p] (assoc p :users (vec (or clients [])))))
       (let [n (m/normalize content)
-            inf @inflight_]
-        (when (and (some? inf) (not= (:new-content inf) n))
-          (reset! inflight_ nil)
-          (reset! doc-reset_ (now-ms))
-          (log-err "socket: doc rejected in-flight write; tools will retry"))
+            inf @inflight_
+            ;; A write emitted on an earlier socket generation is resolved by
+            ;; this frame either way: a dropped ack must not leave inflight_
+            ;; set forever (that latched every later write to :emit-in-flight).
+            newer? (boolean (and (some? inf) (> gen (or (:gen inf) gen))))]
+        (cond
+          (and newer? (= (:new-content inf) n))
+          (do (reset! inflight_ nil)
+              (log-err "socket: in-flight write applied on a newer socket"))
+
+          (and (some? inf) (not= (:new-content inf) n))
+          (do (reset! inflight_ nil)
+              (reset! doc-reset_ (now-ms))
+              (log-err "socket: doc rejected in-flight write; tools will retry"))
+
+          :else nil)
         (if (nil? @state_)
           (reset! state_ (st/make-initial (:note-id @cfg_) rev n (now-ms)))
           (st/on-rebuild! state_ {:rev rev :new-content n} (now-ms)))
-        (st/set-tail! state_ (- (m/utf16-length content) (m/utf16-length n))))
+        (st/set-tail! state_ (- (m/utf16-length content) (m/utf16-length n)))
+        (write-heartbeat!))
       (log-err (str "socket: doc rev " (:rev @state_))))
     (catch :default e
       (log-err (str "socket: doc frame ignored: " (errors/err-message e))))))
 
-(defn- on-operation! [msg]
+(defn- on-operation! [_gen msg]
   (try
     (record-selection! (:rev msg) (:selection msg))
     (let [cur @state_]
@@ -518,7 +787,8 @@
               new-raw (ops/apply-ops-raw raw internal)
               new-content (m/normalize new-raw)]
           (st/on-remote-operation! state_ {:rev (:rev msg) :new-content new-content} (now-ms))
-          (st/set-tail! state_ (- (m/utf16-length new-raw) (m/utf16-length new-content))))))
+          (st/set-tail! state_ (- (m/utf16-length new-raw) (m/utf16-length new-content)))
+          (write-heartbeat!))))
     (catch :default e
       (log-err (str "socket: remote op failed (" (errors/err-message e) "); resyncing from /download"))
       (resync-from-download! "remote-op-failed"))))
@@ -527,7 +797,7 @@
   "Our own op was positioned at (:rev msg). Adopt it: the ack is the rev
    echo, so local state must advance or every following CAS is stale.
    An ack that cannot be ours falls back to /download ground truth."
-  [msg]
+  [_gen msg]
   (let [rev (:rev msg)
         inf @inflight_]
     (log-err (str "socket: ack rev " rev))
@@ -545,30 +815,41 @@
         (resync-from-download! "ack-not-adoptable"))
 
       (and (some? @state_) (not (= rev (:rev @state_))))
-      (resync-from-download! "unsolicited-ack"))))
+      (resync-from-download! "unsolicited-ack")))
+  (write-heartbeat!))
 
-(defn- on-force! [frame]
+(defn- on-force! [gen frame]
   (try
       (let [rev (:rev frame) content (:content frame)]
         (when (or (not (.isInteger js/Number rev)) (not (string? content)))
           (throw (ex-info "malformed force frame" {:code :bad-doc-frame :frame frame})))
         (let [n (m/normalize content)
-              inf @inflight_]
+              inf @inflight_
+              newer? (boolean (and (some? inf) (> gen (or (:gen inf) gen))))]
           ;; A forced rebuild that does not contain our intended result means
           ;; the server rejected/rebased the op. Clear the guard so the next
-          ;; write can proceed; the waiting tool sees content != intent.
-          (when (and (some? inf) (not= (:new-content inf) n))
-            (reset! inflight_ nil)
-            (reset! doc-reset_ (now-ms))
-            (log-err "socket: force rejected in-flight write"))
+          ;; write can proceed; the waiting tool sees content != intent. A
+          ;; matching frame on a newer socket means the write applied.
+          (cond
+            (and newer? (= (:new-content inf) n))
+            (do (reset! inflight_ nil)
+                (log-err "socket: in-flight write applied on a newer socket (force)"))
+
+            (and (some? inf) (not= (:new-content inf) n))
+            (do (reset! inflight_ nil)
+                (reset! doc-reset_ (now-ms))
+                (log-err "socket: force rejected in-flight write"))
+
+            :else nil)
           (if (nil? @state_)
             (reset! state_ (st/make-initial (:note-id @cfg_) rev n (now-ms)))
             (st/on-rebuild! state_ {:rev rev :new-content n} (now-ms))))
+        (write-heartbeat!)
         (log-err (str "socket: force rebuild to rev " rev)))
       (catch :default e
         (log-err (str "socket: force frame ignored: " (errors/err-message e))))))
 
-(defn- on-info! [msg]
+(defn- on-info! [_gen msg]
   (reset! last-info_ msg)
   (log-err (str "socket: info code=" (or (:code msg) "?"))))
 
@@ -585,6 +866,9 @@
    :clear-doc-reset! (fn [] (reset! doc-reset_ nil))
    :allow-guest-writes? (:allow-guest-writes? cfg)
    :connected? (fn [] (t/connected?))
+   ;; Throttled reconnect trigger shared by get-status waits and
+   ;; retry-after-reconnect!. Core decides when it actually connects.
+   :ensure-connected (fn [] (ensure-connected!))
    :now-ms now-ms
    :send-op! (fn [rev internal-ops _sel] (t/send-op! rev (ops->wire internal-ops) nil))
    :fetch-download fetch-download
@@ -647,22 +931,55 @@
       :else (throw (ex-info "bad arg waitMs: integer 0..15000 required"
                             {:code :bad-args :field :waitMs :got v})))))
 
+(defn- checked-bool [args k]
+  (let [v (get args k)]
+    (when (and (some? v) (not (boolean? v)))
+      (throw (ex-info (str "bad arg " k ": boolean required")
+                      {:code :bad-args :field k :expected "boolean" :got v})))
+    (boolean v)))
+
 (defn- handle-get-status [args]
   (let [env @env_
         wait-ms (checked-wait-ms args)
+        force? (checked-bool args :forceReconnect)
         started ((:now-ms env))]
     ;; A cold worker must not answer :not-booted here. Kick boot, then wait
     ;; (or return at once for waitMs 0). The wait REPLACES require-state! for
     ;; this handler: a timeout returns the nil-tolerant status, not an error.
     (when (nil? @(:state env))
       (when-not @booting_ (boot!)))
-    (if (zero? wait-ms)
-      (assoc (tools/get-status env) :waitedMs 0)
-      (-> (tools/wait-for-writable! env (+ started wait-ms)
-                                    (:now-ms env) (:sleep-ms env))
-          (.then (fn [_ok?]
-                   (assoc (tools/get-status env)
-                          :waitedMs (- ((:now-ms env)) started))))))))
+    (cond
+      force?
+      (do
+        ;; force-reconnect! refuses (force-reconnect-blocked) while a write is
+        ;; in flight; it never clears inflight_ itself.
+        (force-reconnect!)
+        (if (zero? wait-ms)
+          (assoc (status-snapshot) :waitedMs 0 :forceReconnect true)
+          (-> (tools/wait-for-writable! env (+ started wait-ms)
+                                        (:now-ms env) (:sleep-ms env)
+                                        (:ensure-connected env))
+              (.then (fn [_ok?]
+                       (assoc (status-snapshot)
+                              :waitedMs (- ((:now-ms env)) started)
+                              :forceReconnect true))))))
+
+      (zero? wait-ms)
+      (assoc (status-snapshot) :waitedMs 0)
+
+      :else
+      (do
+        ;; Disconnected with a wait: trigger the throttled reconnect first.
+        ;; wait-for-writable! also polls the same trigger, which no-ops while a
+        ;; connect is pending or the retry timer is armed.
+        (when (not ((:connected? env)))
+          ((:ensure-connected env)))
+        (-> (tools/wait-for-writable! env (+ started wait-ms)
+                                      (:now-ms env) (:sleep-ms env)
+                                      (:ensure-connected env))
+            (.then (fn [_ok?]
+                     (assoc (status-snapshot)
+                            :waitedMs (- ((:now-ms env)) started)))))))))
 
 (defn- checked-level [args]
   (let [v (:level args)]
@@ -895,8 +1212,17 @@
                                  " reason=" reason))
                    res))))))
 
+(defn- handle-doctor
+  "doctor is a supervisor tool. Core has no registry of peers and no note
+   resolution, so a direct call is refused with a nameable code rather than
+   unknown-tool or a partial answer."
+  [_args]
+  (throw (ex-info "doctor requires the multi supervisor"
+                  {:code :doctor-requires-supervisor})))
+
 (def tool-handlers
   {"get-status" handle-get-status
+   "doctor" handle-doctor
    "read-section" handle-read-section
    "read-note" handle-read-note
    "apply-ops" handle-apply-ops
@@ -1014,11 +1340,14 @@
      :serverInfo {:name server-name :version server-version}}))
 
 (defn- visible-tool-defs
-  "set-note is whole-doc replace: never advertised unless explicitly enabled."
+  "set-note is whole-doc replace: never advertised unless explicitly enabled.
+   doctor is multi-only: core would only refuse it."
   []
-  (if (:enable-set-note? @cfg_)
-    schema/tool-defs
-    (vec (remove #(= "set-note" (:name %)) schema/tool-defs))))
+  (vec (remove (fn [d]
+                 (or (= "doctor" (:name d))
+                     (and (= "set-note" (:name d))
+                          (not (:enable-set-note? @cfg_)))))
+               schema/tool-defs)))
 
 (defn- handle-call [id params]
   (if (nil? id)
@@ -1088,6 +1417,7 @@
   (when (not @shut_)
     (reset! shut_ true)
     (log-err "hedgedoc-mcp: shutdown")
+    (stop-heartbeat!)
     (try (t/disconnect!) (catch :default _e nil))
     (try
       (let [rl @rl_]
@@ -1109,34 +1439,65 @@
 
 ;; ---------------- boot ----------------
 
-(defn- connect-t! []
-  (let [cfg @cfg_]
-    (-> (t/connect! {:server-url (:origin cfg)
-                     :base-path (:base-path cfg)
-                     :probe-url (:base-url cfg)
-                     :note-id (:note-id cfg)
-                     :cookie @cookie_
-                     :client-major (:client-major cfg)
-                     :transports (:transports cfg)
-                     :on-doc on-doc!
-                     :on-operation on-operation!
-                     :on-ack on-ack!
-                     :on-force on-force!
-                     :on-info on-info!
-                     :on-connect on-connect!
-                     :on-connect-error on-connect-error!
-                     :on-disconnect (fn [info]
-                                      (st/invalidate-rev! state_)
-                                      (log-err (str "socket: disconnect "
-                                                    (errors/err-message (:reason info))
-                                                    "; rev invalidated")))})
-        (.then (fn [_s]
-                 (log-err "socket: connected")
-                 nil))
-        (.catch (fn [e]
-                  (log-err (str "socket: connect failed: " (errors/err-message e) " "
-                                (encode-msg (errors/err-map e))))
-                  nil)))))
+(defn- connect-t!
+  "The scheduler's single entry point (boot!'s initial call is the exception).
+   Serialized with transport/connect!: a second call while one is pending joins
+   it, so two calls can never open two sockets or bump the generation under
+   listeners wired for the pending attempt."
+  []
+  (cond
+    @shut_ nil
+    (some? @reconnect-inflight_)
+    (do (log-err "socket: connect-t! joining pending attempt")
+        @reconnect-inflight_)
+    :else
+    (let [;; A write emitted on the old socket is stamped with the generation
+          ;; that owned it, so a doc frame from the new socket can resolve it.
+          _ (when (some? @inflight_)
+              (swap! inflight_ (fn [inf]
+                                 (if (some? inf) (assoc inf :gen @conn-gen_) inf))))
+          gen (swap! conn-gen_ inc)
+          cfg @cfg_
+          gb (fn [f]
+               (fn [x]
+                 (when-not (m/gen-stale? gen @conn-gen_)
+                   (f gen x))))
+          p (-> (t/connect! {:server-url (:origin cfg)
+                             :base-path (:base-path cfg)
+                             :probe-url (:base-url cfg)
+                             :note-id (:note-id cfg)
+                             :cookie @cookie_
+                             :client-major (:client-major cfg)
+                             :transports (:transports cfg)
+                             :on-doc (gb on-doc!)
+                             :on-operation (gb on-operation!)
+                             :on-ack (gb on-ack!)
+                             :on-force (gb on-force!)
+                             :on-info (gb on-info!)
+                             :on-connect (gb on-connect!)
+                             :on-connect-error (gb on-connect-error!)
+                             :on-disconnect
+                             (fn [info]
+                               (when-not (m/gen-stale? gen @conn-gen_)
+                                 (on-disconnect! gen info)))})
+                (.then (fn [_s] nil))
+                (.catch (fn [e]
+                          (when-not (m/gen-stale? gen @conn-gen_)
+                            (reset! last-connect-error_
+                                    {:message (errors/err-message e) :at (now-ms)})
+                            (log-err (str "socket: connect failed: "
+                                          (errors/err-message e) " "
+                                          (encode-msg (errors/err-map e))))
+                            (schedule-reconnect! gen))
+                          nil)))]
+      (reset! last-attempt-at_ (now-ms))
+      (clear-reconnect-timer!)
+      (reset! next-attempt-at_ nil)
+      (reset! reconnect-inflight_ p)
+      (.finally p (fn []
+                    (when (identical? p @reconnect-inflight_)
+                      (reset! reconnect-inflight_ nil))))
+      p)))
 
 (defn- boot-download!
   "One /download attempt; schedules another on failure (bounded)."
@@ -1175,8 +1536,10 @@
   (try
     (reset! cfg_ (read-config))
     (reset! cookie_ (:cookie @cfg_))
+    (reset! started-at_ (now-ms))
     (reset! env_ (make-env @cfg_))
     (start-stdio!)
+    (start-heartbeat!)
     (log-err (str "hedgedoc-mcp " server-version
                   " note=" (:note-id @cfg_)
                   " url=" (:base-url @cfg_)

@@ -26,7 +26,7 @@ Unofficial client. Not affiliated with or endorsed by the HedgeDoc project.
 
 | Item | State |
 |---|---|
-| Version | `0.2.3` |
+| Version | `0.2.4` |
 | HedgeDoc 1.12 | Tested |
 | HedgeDoc 1.11 | Expected to work, not exercised yet |
 | HedgeDoc 1.10 and older | Refused at connect (they use Socket.IO 2) |
@@ -274,7 +274,7 @@ decide; a blind re-emit can duplicate the edit.
 
 | Tool | What it does |
 |---|---|
-| `get-status` | Reports revision, hash, headings, idle time, rev velocity, auth kind, connection state, and `writable`. `waitMs` waits for boot and reports `waitedMs`. |
+| `get-status` | Reports revision, hash, headings, idle time, rev velocity, auth kind, connection state, `writable`, and worker/socket diagnostics. `waitMs` waits and triggers a throttled reconnect; `forceReconnect` disposes and reconnects now. |
 | `read-section` | Returns one heading's content with UTF-16 offsets. `occurrence` picks among duplicate headings, `level` narrows by heading level, and `includeSubsections` reads the whole subtree. A subtree read can be written back with the same flags. |
 | `read-note` | Returns the note, or a page of lines, with front matter and heading line numbers. `sections` controls the heading list. |
 | `apply-ops` | Writes raw ops under CAS, or replaces a section body via `new-section-text` plus `heading`. `includeSubsections` replaces the whole subtree. |
@@ -285,21 +285,23 @@ decide; a blind re-emit can duplicate the edit.
 | `delete-lines` | Deletes a line range, one line by default. Refuses to run past the end of the note. |
 | `search` | Searches lines by substring or regex, case insensitive by default. |
 | `presence` | Reports users and selection data, advisory only; the gate is the pre-emit overlap check inside `apply-ops`. |
-| `list-notes` | Lists notes with a live worker, plus the default note. |
+| `list-notes` | Lists notes with a live worker, the default note, and a `workers` array with pid, version, connected, writable, last connect, and reconnect attempts. |
+| `doctor` | Read-only health report in multi mode: server status, per-worker socket/rev/hash, heartbeat registry, duplicate note ids, and version mismatch. It never kills or reaps. |
 | `set-note` | Replaces the whole document under the gate; only with `HEDGEDOC_ENABLE_SET_NOTE`. |
 
 ### Arguments
 
 | Argument | Tools | Notes |
 |---|---|---|
-| `note-id` | Every tool except `list-notes`, in the multi-note binary | Selects the worker. The single-note `core.mjs` rejects it. |
-| `waitMs` | `get-status` | Integer 0..15000, default 0. Waits up to that many ms for boot to land, then returns the status with `waitedMs`. Costs wall-clock time on the call. |
+| `note-id` | Every tool except `list-notes` and `doctor`, in the multi-note binary | Selects the worker. The single-note `core.mjs` rejects it. |
+| `waitMs` | `get-status` | Integer 0..15000, default 0. Waits up to that many ms for boot to land and triggers a throttled reconnect while disconnected, then returns the status with `waitedMs`. |
+| `forceReconnect` | `get-status` | Boolean. Disposes the socket and reconnects now. Refuses with `force-reconnect-blocked` while a write is in flight. |
 | `level`, `includeSubsections` | `read-section`, `apply-ops`, `append-to-section` | `level` is 1..6 and filters without a fallback. `includeSubsections: true` reads or writes from after the heading line to the next heading at or above that level, or to the document end. A subtree read returns `writeRoundTrip: true` and echoes `heading`, `level`, `occurrence`, and `includeSubsections`; there is no nested anchor object. Raw ops plus either flag is `bad-args`. |
 | `sections` | `read-note` | `"all"` (default), `"none"`, or `"window"` for headings inside the returned slice. A boolean is rejected with a hint to use `"none"`. `get-status` still returns every heading. |
 | `base-rev`, `base-hash` | Every write | Taken from a fresh read. A stale base is refused. |
 | `startLine`, `endLine`, `oldText`, `newText` | `replace-range` | Inclusive 1-based range. `oldText` is the lines joined by `\n`, no trailing newline. `newText` may be multi-line; blank deletes the range. |
 | `dryRun` | Write tools | Returns a numbered preview with `status: dry-run` and `written: false`, and emits nothing. Aliases: `dry-run`, `dry_run`, `dry-run?`. |
-| `preview` | `apply-ops`, `append-to-section`, `replace-lines`, `insert-lines`, `delete-lines` | Dry-run only: `"window"` (default, six-line radius around the target), `"region"` (the whole affected range), or `"tail"` (its last 12 lines). `set-note` does not take it. |
+| `preview` | `apply-ops`, `append-to-section`, `replace-lines`, `replace-range`, `insert-lines`, `delete-lines` | Dry-run only: `"window"` (default, six-line radius around the target), `"region"` (the whole affected range), or `"tail"` (its last 12 lines). `set-note` does not take it. |
 | `verify` | Write tools | `false` skips the download poll and reports `verified: ack` once the revision has advanced and the intended content is visible locally. Alias: `verify?`. |
 | `regex`, `caseSensitive` | `search` | Aliases: `regex?`, `case-sensitive?`. |
 | `force`, `reason` | `set-note` | Required. `set-note` takes none of the flags above. |
@@ -311,6 +313,24 @@ spelling is rejected as `bad-args`.
 Typical loop: `get-status`, then `read-note` or `read-section`, then a dry run,
 then the write. On `stale-revision`, read again and use the new rev and hash. On
 `applied-but-unconfirmed`, re-read before doing anything else.
+
+## Reconnect and retries
+
+`retryable` and `retryAfterMs` are advisory. There is no automatic write retry.
+A write that emitted may have landed; a client must re-read before deciding.
+
+| Result | Safe action |
+|---|---|
+| `not-connected` | Retry after `retryAfterMs`, or call `get-status` with `waitMs` first. |
+| `emit-in-flight` | Read status, wait for the in-flight write to settle. Never re-emit. |
+| `applied-but-unconfirmed` | Re-read. If the rev did not advance, decide. Do not blind re-emit. |
+| `stale-revision`, `rev-unknown` | Fresh read, rebuild the edit, new op. |
+| `rate-limited` | Retry after `retryAfterMs`; no note was created. |
+| `create-unknown` | Operator checks the instance's recent notes. Never retry the POST. |
+
+`get-status` with `waitMs` triggers a throttled reconnect while disconnected.
+`forceReconnect: true` disposes and reconnects now, but refuses while a write is
+in flight so the ack cannot be orphaned.
 
 ## Troubleshooting
 
@@ -379,6 +399,8 @@ node test/retry-safety.mjs
 node test/remote-op-fold.mjs
 node test/bin-launch.mjs
 node test/arg-validation.mjs
+npm run test:socket
+npm run test:diagnostics
 ./scripts/e2e.sh
 nix flake check
 ```
@@ -387,6 +409,15 @@ nix flake check
 `podman-compose` if `127.0.0.1:3000/status` is not already answering, registers
 `bot@dev.local`, and needs open registration on the instance. Set `HEDGEDOC_URL`
 to use an existing dev instance instead.
+
+`test/reconnect-live.mjs` restarts the dev app container and proves the worker
+reconnects and writes without a session restart. It is deliberately outside the
+default e2e path because it restarts the dev container, and it refuses to run
+without an explicit dev guard:
+
+```bash
+HEDGEDOC_DEV=1 npm run test:reconnect-live
+```
 
 `nix flake check` builds the package and runs the version check, property tests,
 GC, retry, remote-op, launcher, and argument validation suites from

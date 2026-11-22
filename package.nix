@@ -11,7 +11,7 @@ buildNpmPackage {
   src = ./.;
 
   # Refresh with: nix run nixpkgs#prefetch-npm-deps -- package-lock.json
-  npmDepsHash = "sha256-hIjFlNYNP+5/d5gCqbwq4LnDdpJdAiz4TSWsmZQiFbc=";
+  npmDepsHash = "sha256-o4tT0G1J1AFPwt6FugO+D154tZQ7frtyfv0E/KIgMeg=";
 
   nativeBuildInputs = [nodejs makeWrapper];
 
@@ -39,9 +39,13 @@ buildNpmPackage {
     node test/pbt-4-replace-lines.mjs
     node test/snapshot-gc.mjs
     node test/retry-safety.mjs
-    node test/remote-op-fold.mjs
-    node test/bin-launch.mjs
-    node test/arg-validation.mjs
+    echo "=== remote-op-fold"; node test/remote-op-fold.mjs
+    echo "=== bin-launch"; node test/bin-launch.mjs
+    echo "=== arg-validation"; node test/arg-validation.mjs
+    # reconnect.mjs and worker-diagnostics.mjs spawn MCP children and are
+    # host tests. Run them with npm run test:socket / test:diagnostics, or in
+    # scripts/e2e.sh; the Nix sandbox does not give those children a reliable
+    # stdio/network environment.
     runHook postCheck
   '';
 

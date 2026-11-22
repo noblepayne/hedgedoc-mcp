@@ -371,14 +371,21 @@
 (defn wait-for-writable!
   "Connected AND holding a revision learned on this socket generation. A
    reconnect invalidates the rev; writing before the next doc frame would use
-   -1 or a stale base."
-  [env deadline now-ms sleep-ms]
-  (if (and ((:connected? env)) (> (:rev @(:state env)) -1))
-    (js/Promise.resolve true)
-    (if (> (now-ms) deadline)
-      (js/Promise.resolve false)
-      (-> (sleep-ms 100)
-          (.then (fn [_] (wait-for-writable! env deadline now-ms sleep-ms)))))))
+   -1 or a stale base. ensure-connected-fn is optional and throttled by core:
+   it may be called every 100 ms poll and must be cheap and idempotent."
+  ([env deadline now-ms sleep-ms]
+   (wait-for-writable! env deadline now-ms sleep-ms nil))
+  ([env deadline now-ms sleep-ms ensure-connected-fn]
+   (if (and ((:connected? env)) (> (:rev @(:state env)) -1))
+     (js/Promise.resolve true)
+     (if (> (now-ms) deadline)
+       (js/Promise.resolve false)
+       (do
+         (when (some? ensure-connected-fn) (ensure-connected-fn))
+         (-> (sleep-ms 100)
+             (.then (fn [_]
+                      (wait-for-writable! env deadline now-ms sleep-ms
+                                          ensure-connected-fn)))))))))
 
 (defn- retry-after-reconnect!
   "Re-emit only when the previous attempt provably did not reach the server
@@ -387,7 +394,8 @@
    coordinates into a document that moved, so abort."
   [env args intent state attempt]
   (-> (wait-for-writable! env (+ ((:now-ms env)) 5000)
-                          (:now-ms env) (:sleep-ms env))
+                          (:now-ms env) (:sleep-ms env)
+                          (:ensure-connected env))
       (.then (fn [ok?]
                (when-not ok?
                  (throw (err :rev-unknown

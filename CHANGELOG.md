@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.2.4 — 2026-11-21
+
+### Added
+
+- Socket auto-reconnect with 1s to 30s backoff, a generation guard, and
+  serialized connects. socket.io internal reconnection is off; core owns the
+  loop.
+- `get-status` `waitMs` triggers a throttled reconnect while disconnected.
+  `forceReconnect` disposes and reconnects now, and refuses while a write is in
+  flight.
+- Worker and socket diagnostics in `get-status`, plus a `workers` array in
+  `list-notes`.
+- `doctor`, multi mode only: server status, per-worker socket and revision
+  state, a heartbeat registry, duplicate note ids, and version mismatch. It
+  never kills or reaps.
+- A live reconnect test against the dev container: restart the app, recover,
+  write, and restore without a session restart.
+
+### Fixed
+
+- A write ack orphaned by a reconnect no longer latches `emit-in-flight`
+  forever. A doc frame from a newer generation resolves the intent.
+- The version probe is bounded at 4s, so a half-restarted server cannot leave a
+  connect attempt pending.
+- A 503 boot response is no longer adopted as a session. Login retries with
+  bounded backoff, and auth errors do not stay on the long network backoff.
+
 ## 0.2.3 — 2026-11-21
 
 ### Added

@@ -104,6 +104,15 @@ content equals the capture after trimming.
 Restore with `replace-range` over the three lines back to the original text.
 Line count and markers return to baseline.
 
+**S14: reconnect discipline.** After the note worker loses its socket (for
+example the HedgeDoc process restarted), `get-status` with `waitMs` must
+trigger a reconnect and return `connected: true` and `writable: true` without a
+session restart. The `socket` object must show the generation and last error.
+A write attempted while disconnected returns `not-connected` and emits nothing.
+After recovery, re-read and rebuild the edit; never re-emit the old write. If a
+write returned `applied-but-unconfirmed`, re-read and check the hash before
+deciding. `doctor` reports the worker and socket state; it never kills.
+
 ## Report
 
 For each scenario: PASS/FAIL, tool, revs before/after, verification field,

@@ -96,3 +96,41 @@
       :hash     (sha256-fn n)
       :snapshot-id (sha256-fn (snapshot-preimage rev n))
       :at       now-ms})))
+
+;; ---------------- socket lifecycle (pure) ----------------
+;; Core owns the only reconnect loop. These helpers keep the schedule, the
+;; generation guard, and the forceReconnect refusal testable without importing
+;; core.cljs (which calls main() at module load).
+
+(def reconnect-backoff-ms
+  "Reconnect delay after attempt 0, 1, 2, ... Capped at 30 s."
+  [1000 2000 4000 8000 16000 30000])
+
+(defn backoff-ms
+  "Delay before reconnect attempt n (0-based), capped at 30 s. jitter-fn maps
+   the scheduled delay to the actual one and defaults to identity, so the bare
+   schedule stays exact in tests."
+  ([attempt] (backoff-ms attempt identity))
+  ([attempt jitter-fn]
+   (let [last-i (dec (count reconnect-backoff-ms))
+         i #?(:clj (long (max 0 (min last-i (long attempt))))
+              :cljs (max 0 (min last-i attempt)))
+         base (nth reconnect-backoff-ms i)
+         j (jitter-fn base)]
+     (if (number? j) (max 0 j) base))))
+
+(defn gen-stale?
+  "True when a callback or timer captured generation gen that no longer owns
+   the connection. A nil generation is always stale (nothing has connected)."
+  [gen current-gen]
+  (or (nil? gen) (not= gen current-gen)))
+
+(defn force-reconnect-block
+  "nil when a forced reconnect may dispose the socket; otherwise the refusal
+   reason. Disposing mid-write would drop the op ack, leave the intent orphaned,
+   and invite a duplicate retry, so an in-flight write always blocks it."
+  [inflight shutting-down?]
+  (cond
+    (some? inflight) :write-in-flight
+    shutting-down? :shutting-down
+    :else nil))

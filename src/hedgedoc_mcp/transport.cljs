@@ -8,14 +8,23 @@
             [hedgedoc-mcp.state :as st]))
 
 (defonce socket_ (atom nil))
+;; Serialized connect: one probe + one socket at a time. A second caller while
+;; one is pending joins the same promise; two uncoordinated connects could
+;; otherwise clobber socket_ with a stale socket (the replace block runs after
+;; the version probe).
+(defonce connect-promise_ (atom nil))
 
 (defn server-version
-  "GET / and parse hedgedoc-version header."
+  "GET / and parse hedgedoc-version header. Bounded: a down or half-restarted
+   server must not leave connect! pending on a hung fetch."
   [server-url]
-  (-> (js/fetch (str server-url "/") #js {})
-      (.then (fn [res]
-               (or (.get (.-headers res) "hedgedoc-version")
-                   "unknown")))))
+  (let [ctrl (js/AbortController.)
+        timer (js/setTimeout (fn [] (.abort ctrl)) 4000)]
+    (-> (js/fetch (str server-url "/") #js {:signal (.-signal ctrl)})
+        (.then (fn [res]
+                 (or (.get (.-headers res) "hedgedoc-version")
+                     "unknown")))
+        (.finally (fn [] (js/clearTimeout timer))))))
 
 (defn assert-compatible!
   "Throws {:code :incompatible-client} unless server-ver and client-major are compatible."
@@ -103,7 +112,7 @@
               :else nil)))
   socket)
 
-(defn connect!
+(defn- do-connect!
   "Opens the OT socket for note-id."
   [opts]
   (let [{:keys [server-url probe-url note-id cookie transports base-path
@@ -136,6 +145,11 @@
                      (reset! socket_ nil)))
                  (let [opts-js #js {:query #js {:noteId note-id}
                                     :transports xports
+                                    ;; Core owns the one reconnect loop
+                                    ;; (backoff + generation guard). socket.io
+                                    ;; reconnecting on its own would be a second
+                                    ;; uncoordinated loop.
+                                    :reconnection false
                                     :extraHeaders (if cookie #js {:Cookie cookie} #js {})}
                        _ (when (and (some? base-path) (not (str/blank? (str base-path))))
                            (aset opts-js "path" (str base-path "/socket.io/")))
@@ -160,6 +174,16 @@
                             (on-disconnect {:reason reason}))))
                    (reset! socket_ s)
                    s))))))
+
+(defn connect!
+  "Serialized do-connect!: a second call while one is pending returns the same
+   promise and never opens a second socket."
+  [opts]
+  (or @connect-promise_
+      (let [p (-> (do-connect! opts)
+                  (.finally (fn [] (reset! connect-promise_ nil))))]
+        (reset! connect-promise_ p)
+        p)))
 
 (defn send-op!
   "Emits one op and resolves once emitted. Refuses while disconnected: an emit

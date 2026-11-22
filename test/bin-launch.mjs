@@ -7,7 +7,9 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
 const root = resolve(new URL('..', import.meta.url).pathname);
-const dir = mkdtempSync(join(tmpdir(), 'hedgedoc-mcp-bin-'));
+// Keep the link inside the build tree: the Nix sandbox does not resolve a
+// /tmp symlink back into /build reliably.
+const dir = mkdtempSync(join(root, '.bin-launch-'));
 const link = join(dir, 'hedgedoc-mcp');
 symlinkSync(join(root, 'bin/hedgedoc-mcp.mjs'), link);
 
@@ -69,7 +71,7 @@ try {
   check(!/Cannot find module/i.test(stderr), 'worker module resolves (no Cannot find module)');
   check(/not-booted|rev|error/i.test(text), 'tools/call reaches the worker');
 } catch (e) {
-  check(false, String(e));
+  check(false, `${String(e)} pid=${child.pid} exit=${child.exitCode}\n--- stderr ---\n${stderr.slice(-2000)}`);
 } finally {
   child.stdin.end();
   child.kill('SIGTERM');

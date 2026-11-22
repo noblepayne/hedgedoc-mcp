@@ -4,13 +4,14 @@
    one, HEDGEDOC_NOTE_ID is the default. Isolation is deliberate: each note has
    its own socket, revision state and in-flight write."
   (:require [clojure.string :as str]
+            [hedgedoc-mcp.registry :as registry]
             [hedgedoc-mcp.schema :as schema]
             ["node:readline" :as rl]
             ["node:child_process" :as cp]
             ["node:url" :refer [fileURLToPath]]))
 
 (def server-name "hedgedoc-mcp")
-(def server-version "0.2.3")
+(def server-version "0.2.4")
 (def mcp-protocol-version "2024-11-05")
 
 (defonce children (atom {}))
@@ -65,8 +66,13 @@
 
 (defn- fail-pending! [ch reason]
   (doseq [[_ p] @(aget ch "pending")]
-    (send! {:jsonrpc "2.0" :id (aget p "parent")
-            :error {:code -32603 :message (str "worker exited: " reason)}}))
+    (if-let [resolved (aget p "resolve")]
+      ;; Supervisor-internal query: resolve the promise, never emit a
+      ;; parent-less JSON-RPC error onto stdout.
+      (resolved #js {:status "error" :message (str "worker exited: " reason)
+                     :socket #js {} :worker #js {} :writable false :rev -1})
+      (send! {:jsonrpc "2.0" :id (aget p "parent")
+              :error {:code -32603 :message (str "worker exited: " reason)}})))
   (reset! (aget ch "pending") {}))
 
 (defn- fail-queue! [ch reason]
@@ -112,27 +118,37 @@
                       txt (try (aget (aget (aget result "content") 0) "text")
                                (catch :default _e nil))
                       booting? (and (some? txt) (str/includes? (str txt) "not-booted"))
-                      attempts (or (aget p "attempts") 0)]
-                  (cond
-                    (and booting? (< attempts 40))
-                    (js/setTimeout
-                     (fn []
-                       (let [cid (swap! (aget ch "next-id") inc)
-                             pinfo (assoc p :attempts (inc attempts))]
-                         (swap! (aget ch "pending") assoc cid
-                                (assoc pinfo :timer (arm-timeout! ch cid pinfo)))
-                         (send-child! ch {:jsonrpc "2.0" :id cid :method "tools/call"
-                                          :params {:name (aget p "name")
-                                                   :arguments (aget p "args")}})))
-                     300)
+                      attempts (or (aget p "attempts") 0)
+                      resolved (aget p "resolve")]
+                  (if (some? resolved)
+                    ;; Supervisor-internal query (list-notes / doctor). One
+                    ;; answer, no not-booted retry, and never a kill: the 5s cap
+                    ;; lives in query-child-status!.
+                    (do
+                      (when-let [tm (aget p "timer")] (js/clearTimeout tm))
+                      (resolved (or (try (js/JSON.parse txt) (catch :default _e nil))
+                                    #js {:status "error" :socket #js {} :worker #js {}
+                                         :writable false :rev -1})))
+                    (cond
+                      (and booting? (< attempts 40))
+                      (js/setTimeout
+                       (fn []
+                         (let [cid (swap! (aget ch "next-id") inc)
+                               pinfo (assoc p :attempts (inc attempts))]
+                           (swap! (aget ch "pending") assoc cid
+                                  (assoc pinfo :timer (arm-timeout! ch cid pinfo)))
+                           (send-child! ch {:jsonrpc "2.0" :id cid :method "tools/call"
+                                            :params {:name (aget p "name")
+                                                     :arguments (aget p "args")}})))
+                       300)
 
-                    (aget msg "error")
-                    (send! {:jsonrpc "2.0" :id (aget p "parent")
-                            :error (aget msg "error")})
+                      (aget msg "error")
+                      (send! {:jsonrpc "2.0" :id (aget p "parent")
+                              :error (aget msg "error")})
 
-                    :else
-                    (send! {:jsonrpc "2.0" :id (aget p "parent")
-                            :result result})))))
+                      :else
+                      (send! {:jsonrpc "2.0" :id (aget p "parent")
+                              :result result}))))))
             :else nil))))))
 
 (defn- spawn-child! [note]
@@ -196,6 +212,33 @@
                          :params {:name name :arguments clean}}))
       (swap! (aget ch "queue") conj {:parent parent :name name :args clean}))))
 
+;; ---------- supervisor queries (read-only, bounded, never killing) ----------
+
+(defn- query-child-status!
+  "Ask one child for get-status. Resolves with the parsed result, or
+   #js {:status \"timeout\"} after timeout-ms. This path never recycles,
+   kills, or retries: a wedged child costs one timeout, not the supervisor. A
+   late reply finds no pending entry and is ignored."
+  [ch timeout-ms]
+  (js/Promise.
+   (fn [resolve _reject]
+     (let [cid (swap! (aget ch "next-id") inc)
+           timer (js/setTimeout
+                  (fn []
+                    (swap! (aget ch "pending") dissoc cid)
+                    (resolve #js {:status "timeout"}))
+                  timeout-ms)]
+       (swap! (aget ch "pending") assoc cid
+              {:parent nil
+               :note (aget ch "note")
+               :name "get-status"
+               :args #js {}
+               :attempts 0
+               :timer timer
+               :resolve (fn [v] (resolve v))})
+       (send-child! ch {:jsonrpc "2.0" :id cid :method "tools/call"
+                        :params {:name "get-status" :arguments #js {}}})))))
+
 ;; ---------- parent tool surface ----------
 
 (defn- env-flag? [k]
@@ -210,18 +253,151 @@
                        (not (env-flag? "HEDGEDOC_ENABLE_SET_NOTE")))))
         (mapv (fn [d]
            (let [sch (:inputSchema d)
-                 props (assoc (:properties sch) :note-id {:type "string"})]
+                 ;; doctor is supervisor-owned: it takes no note-id and is
+                 ;; handled before note resolution.
+                 props (if (= "doctor" (:name d))
+                         (:properties sch)
+                         (assoc (:properties sch) :note-id {:type "string"}))]
              (assoc d :inputSchema (assoc sch :properties props))))))
    {:name "list-notes"
-    :description "List note ids that currently have a worker (and the default note, if configured)."
+    :description "List note ids that currently have a worker (and the default note), plus a workers array with pid, version, connected, writable, last-connect time, and reconnect attempts."
     :inputSchema {:type "object" :properties {} :additionalProperties false}}))
 
+(defn- find-entry [entries note pid]
+  (first (filter (fn [e] (and (= note (:note e)) (= pid (:pid e)))) entries)))
+
+(defn- worker-row
+  "Pinned list-notes.workers shape. :status appears only when the fallback
+   query timed out, and then connected/writable are false."
+  [note pid version connected writable last-connect attempts status]
+  (cond-> {:note note
+           :pid pid
+           :version version
+           :connected (boolean connected)
+           :writable (boolean writable)
+           :lastConnectAt last-connect
+           :attempts attempts}
+    (some? status) (assoc :status status)))
+
+(defn- status-row
+  "Row from a live get-status answer; a timeout reports connected false."
+  [note pid st]
+  (if (= "timeout" (:status st))
+    (worker-row note pid server-version false false nil 0 "timeout")
+    (let [sock (or (:socket st) {})
+          wk (or (:worker st) {})]
+      (worker-row note pid
+                  (or (:version wk) server-version)
+                  (:connected sock)
+                  (:writable st)
+                  (:lastConnectAt sock)
+                  (:reconnectAttempts sock)
+                  nil))))
+
+(defn- registry-row [note pid e]
+  (worker-row note pid (:version e) (:connected e) (:writable e)
+              (:lastConnectAt e) (:attempts e) nil))
+
+(defn- worker-row-for
+  "Registry first: a fresh heartbeat costs no query. A missing or stale
+   heartbeat falls back to one 5s get-status; a timeout is reported, not
+   retried, and nothing is killed."
+  [entries ch]
+  (let [note (aget ch "note")
+        pid (aget (aget ch "proc") "pid")
+        e (find-entry entries note pid)]
+    (if (and (some? e) (not (:stale e)))
+      (js/Promise.resolve (registry-row note pid e))
+      (-> (query-child-status! ch 5000)
+          (.then (fn [st] (status-row note pid st)))))))
+
+(defn- note-worker-rows []
+  (let [chs (vec (vals @children))
+        entries (try (registry/read-entries) (catch :default _e []))]
+    (-> (js/Promise.all (mapv (fn [ch] (worker-row-for entries ch)) chs))
+        (.then (fn [rows] (vec rows))))))
+
 (defn- handle-list-notes [id]
-  (send! {:jsonrpc "2.0" :id id
-          :result {:content [{:type "text"
-                              :text (js/JSON.stringify
-                                     (clj->js {:default (default-note)
-                                               :active (vec (keys @children))}))}]}}))
+  (-> (note-worker-rows)
+      (.then (fn [workers]
+               (let [payload {:default (default-note)
+                              ;; Unchanged contract: an id vector.
+                              :active (vec (keys @children))
+                              :workers workers}]
+                 (send! {:jsonrpc "2.0" :id id
+                         :result {:content [{:type "text"
+                                             :text (js/JSON.stringify
+                                                    (clj->js payload))}]}}))))))
+
+;; ---------- doctor (read-only, multi only, never kills) ----------
+
+(defn- http-status!
+  "GET /status with a 5s abort. Reports failure instead of throwing: doctor
+   must answer even when the server is down."
+  []
+  (let [base (str/replace (str (or (env-get "HEDGEDOC_URL") "")) #"/+$" "")
+        ctrl (js/AbortController.)
+        timer (js/setTimeout (fn [] (.abort ctrl)) 5000)]
+    (-> (js/fetch (str base "/status") #js {:signal (.-signal ctrl)})
+        (.then (fn [res]
+                 (-> (.json res)
+                     (.then (fn [j]
+                              (js/clearTimeout timer)
+                              {:ok (boolean (.-ok res))
+                               :httpStatus (.-status res)
+                               :status (:status j)
+                               :version (:version j)})))))
+        (.catch (fn [e]
+                  (js/clearTimeout timer)
+                  {:ok false :error (str (.-message e))})))))
+
+(defn- doctor-worker-row [ch]
+  (let [note (aget ch "note")
+        pid (aget (aget ch "proc") "pid")]
+    (-> (query-child-status! ch 5000)
+        (.then (fn [st]
+                 (if (= "timeout" (:status st))
+                   {:note note :pid pid :version server-version
+                    :status "timeout" :connected false :writable false
+                    :lastError nil
+                    :hint "no get-status answer in 5s; wedged or booting. doctor does not kill it"}
+                   (let [sock (or (:socket st) {})
+                         wk (or (:worker st) {})]
+                     {:note note
+                      :pid pid
+                      :version (or (:version wk) server-version)
+                      :status "ok"
+                      :connected (boolean (:connected sock))
+                      :writable (boolean (:writable st))
+                      :rev (:rev st)
+                      :hash (:hash st)
+                      :socket {:generation (:generation sock)
+                               :lastConnectAt (:lastConnectAt sock)
+                               :lastDisconnectAt (:lastDisconnectAt sock)
+                               :lastDisconnectReason (:lastDisconnectReason sock)
+                               :lastConnectError (:lastConnectError sock)
+                               :reconnectAttempts (:reconnectAttempts sock)
+                               :nextAttemptAt (:nextAttemptAt sock)}
+                      :lastError (or (:lastConnectError sock)
+                                     (:lastDisconnectReason sock))})))))))
+
+(defn- handle-doctor [id]
+  (let [entries (try (registry/read-entries) (catch :default _e []))]
+    (-> (js/Promise.all
+         #js [(http-status!)
+              (js/Promise.all (mapv doctor-worker-row (vec (vals @children))))])
+        (.then (fn [arr]
+                 (let [server (aget arr 0)
+                       workers (vec (aget arr 1))
+                       report (registry/doctor-report
+                               {:server server
+                                :workers workers
+                                :entries (vec entries)
+                                :version server-version})]
+                   (send! {:jsonrpc "2.0" :id id
+                           :result {:content [{:type "text"
+                                               :text (js/JSON.stringify
+                                                      (clj->js report))}]}})))))))
 
 (defn- reply-error [id msg]
   (send! {:jsonrpc "2.0" :id id :error {:code -32602 :message msg}}))
@@ -235,6 +411,11 @@
 
       (= name "list-notes")
       (handle-list-notes id)
+
+      ;; Supervisor-owned, before note resolution: doctor takes no note-id and
+      ;; is never forwarded to a worker.
+      (= name "doctor")
+      (handle-doctor id)
 
       :else
       (let [note (note-of args)]

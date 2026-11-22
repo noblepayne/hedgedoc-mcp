@@ -13,6 +13,9 @@ const child = spawn(process.execPath, ['hedgedoc_mcp/core.mjs'], {
   stdio: ['pipe', 'pipe', 'pipe'],
 });
 let buf = ''; const boxes = new Map();
+// Drain stderr: the worker logs heartbeats/reconnect attempts, and a full
+// pipe blocks its event loop before it can answer initialize.
+child.stderr.on('data', () => {});
 child.stdout.on('data', (d) => {
   buf += String(d);
   let i;
@@ -92,6 +95,19 @@ try {
   });
   check(wired.code !== 'bad-args' && wired.code !== 'unknown-tool',
     `replace-range is dispatched, not unknown-tool/bad-args (${wired.code})`);
+  // doctor is supervisor-only: core does not advertise it, refuses with a
+  // nameable code, and still validates its (empty) argument set.
+  send({ jsonrpc: '2.0', id: 12, method: 'tools/list' });
+  const listed = await wait(12);
+  check(Array.isArray(listed.result?.tools)
+    && !listed.result.tools.some((t) => t.name === 'doctor'),
+    'core tools/list hides doctor');
+  const doctorCore = await call(13, 'doctor', {});
+  check(doctorCore.code === 'doctor-requires-supervisor',
+    `core doctor refusal is doctor-requires-supervisor (${doctorCore.code})`);
+  const doctorBadArg = await call(14, 'doctor', { 'note-id': 'x' });
+  check(doctorBadArg.code === 'bad-args' && Array.isArray(doctorBadArg.data?.unknown),
+    `doctor takes no note-id in core (${doctorBadArg.code})`);
 } catch (e) {
   check(false, String(e));
 } finally {

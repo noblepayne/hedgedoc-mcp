@@ -11,11 +11,14 @@
     "dev:up": "podman-compose -f dev/compose.yml up -d",
     "dev:seed": "node dev/seed.mjs",
     "dev:down": "podman-compose -f dev/compose.yml down -v",
-    "test:pbt": "cd test && node pbt-1-gens.mjs && node pbt-2-transform.mjs --runs 1000 && node pbt-3-invariants.mjs && node pbt-4-replace-lines.mjs && node error-shape.mjs && node model-subtree.mjs && node affected-span.mjs && node intent.mjs && node section-boundary.mjs && node replace-range.mjs",
-    "prepack": "npm run build"
+    "test:pbt": "cd test && node pbt-1-gens.mjs && node pbt-2-transform.mjs --runs 1000 && node pbt-3-invariants.mjs && node pbt-4-replace-lines.mjs && node error-shape.mjs && node model-subtree.mjs && node affected-span.mjs && node intent.mjs && node section-boundary.mjs && node replace-range.mjs && node worker-diagnostics.mjs",
+    "prepack": "npm run build",
+    "test:socket": "node test/reconnect.mjs",
+    "test:diagnostics": "node test/worker-diagnostics.mjs",
+    "test:reconnect-live": "node test/reconnect-live.mjs"
   },
   "type": "module",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "devDependencies": {
     "fast-check": "^4.10.2"
   },

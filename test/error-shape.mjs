@@ -14,10 +14,11 @@ const assert = (c, m) => { if (!c) throw new Error(m); };
 const has = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
 const shape = (code, data = {}) => E.shape_error(code, `msg:${code}`, data);
 
-check('retry table is exactly the five advertised codes', () => {
-  const codes = Object.keys(E.retry_table).sort().join(',');
-  assert(codes === 'emit-in-flight,not-connected,rev-unknown,stale-revision,write-needs-user',
-    `unexpected table: ${codes}`);
+check('retry table has the required codes', () => {
+  // P3-04 adds rate-limited; do not lock the exact key set here.
+  const required = ['emit-in-flight', 'not-connected', 'rev-unknown',
+                    'stale-revision', 'write-needs-user'];
+  for (const code of required) assert(has(E.retry_table, code), `missing ${code}`);
 });
 
 check('not-connected: retryable true, 1000ms', () => {
