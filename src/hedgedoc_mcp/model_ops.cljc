@@ -165,6 +165,16 @@
                                              {:occurrence occurrence :level level})]
     {:start start :end end :content (subs normalized-content start end)}))
 
+(defn region-lines
+  "Target line-region of `heading` in content -> {:start :end :lines}.
+   `opts` is {:occurrence :level}. Level is threaded (section-anchor), so a
+   level-qualified anchor cannot raise :duplicate-heading here. Legacy
+   heading-based intent shape; the resolved-range intent path does not use it."
+  [content heading opts]
+  (let [sections (parse-sections content)
+        {:keys [start end]} (section-anchor sections content heading opts)]
+    {:start start :end end :lines (str/split-lines (subs content start end))}))
+
 ;; ---------- grapheme-safe cuts (UTF-16) ----------
 
 (defn- cu [s i]
@@ -261,17 +271,51 @@
 
 ;; ---------- section-level op builders ----------
 
-(defn section-replace-ops
-  "Ops replacing the content range of `heading` with `new-text`.
-   Aborts :fence-split if a range boundary lies inside a fence, the old span
-   has odd fence parity (would orphan the other half), or new-text is unbalanced."
-  [old-content sections heading new-text {:keys [occurrence]}]
-  (assert (base/trailing-nl-valid? old-content) "section-replace-ops needs normalized old")
-  (let [{:keys [start end]} (section->offsets sections old-content heading {:occurrence occurrence})
-        span (subs old-content start end)
-        repl0 (base/normalize new-text)
-        ;; keep a blank line before the next heading, exactly like append
-        repl (if (< end (base/utf16-length old-content)) (str repl0 "\n") repl0)]
+(def ^:private blank-line-re #"^[ \t]*$")
+
+(defn- strip-blank-edge-lines
+  "Normalized text -> the same text with leading/trailing blank lines
+   (`^[ \\t]*$`) removed and re-terminated with exactly one \\n. Returns nil
+   when nothing but blank lines remains, so callers never hand an empty string
+   to base/normalize (which maps \"\" -> \"\\n\" and would fake a body line).
+   Indexed loop: squint's lazy seqs are unmemoized generators."
+  [normalized]
+  (assert (base/trailing-nl-valid? normalized) "strip-blank-edge-lines needs normalized text")
+  (let [lines (vec (str/split normalized #"\n" -1))
+        n (max 0 (dec (count lines)))
+        lo (loop [i 0]
+             (if (and (< i n) (re-matches blank-line-re (nth lines i)))
+               (recur (inc i))
+               i))
+        hi (loop [j n]
+             (if (and (> j lo) (re-matches blank-line-re (nth lines (dec j))))
+               (recur (dec j))
+               j))
+        kept (loop [i lo acc []]
+               (if (>= i hi) acc (recur (inc i) (conj acc (nth lines i)))))]
+    (when (seq kept)
+      (str (str/join "\n" kept) "\n"))))
+
+(defn section-replace-range-ops
+  "Ops replacing content range {:start :end} with `new-text`. The range is
+   the one resolve-ops picked (plain body, or subtree range when the caller
+   resolved with the subtree flag), so it is never resolved a second time.
+   The body is constructed, not probed for a prefix: one blank line after the
+   heading, the replacement with blank edge lines stripped, one terminating
+   \\n, plus one more \\n when a next heading follows (that second \\n is the
+   blank line before it). Blank or whitespace-only text is exactly \\n whether
+   or not the section is last: that \\n IS the shared blank line, so adding the
+   separator after blank text would produce two. Aborts :fence-split if a range
+   boundary lies inside a fence, the old span has odd fence parity (would
+   orphan the other half), or new-text is unbalanced."
+  [old-content {:keys [start end]} new-text]
+  (assert (base/trailing-nl-valid? old-content) "section-replace-range-ops needs normalized old")
+  (let [span (subs old-content start end)
+        inner (strip-blank-edge-lines (base/normalize new-text))
+        repl (if (nil? inner)
+               "\n"
+               (str "\n" inner
+                    (when (< end (base/utf16-length old-content)) "\n")))]
     (cond
       (or (in-fence? old-content start) (in-fence? old-content end))
       (throw (ex-info "replace boundary lies inside a fenced block"
@@ -282,20 +326,56 @@
       (fence-odd? repl)
       (throw (ex-info "replacement text has unbalanced fence"
                       {:code :fence-split :reason :unbalanced-replacement})))
-    (content->ops old-content
-                  (base/ensure-one-trailing-nl
-                   (str (subs old-content 0 start) repl (subs old-content end))))))
+    (let [composed (base/ensure-one-trailing-nl
+                    (str (subs old-content 0 start) repl (subs old-content end)))]
+      ;; Identity -> [] so resolve-ops raises :no-op. content->ops would
+      ;; return [:retain n] for identical text, which would bump a rev for
+      ;; nothing and make the second read-then-restore look like a write.
+      (if (= composed old-content)
+        []
+        (content->ops old-content composed)))))
 
-(defn append-to-section-ops
-  "Pure insert of `text` (normalized to exactly-one-\\n block) at section end
-   (before next heading). Aborts :fence-split if the insert point is in-fence."
-  [old-content sections heading text {:keys [occurrence]}]
-  (assert (base/trailing-nl-valid? old-content) "append-to-section-ops needs normalized old")
+(defn write-range
+  "The one range a section write uses: an explicit :target-range wins (the
+   caller resolved it already); otherwise the subtree range when
+   :includeSubsections is set, else the plain body (level + occurrence aware).
+   Default (no flags) is exactly section->offsets, so the leaf path stays the
+   WO-07 writer. Public so the handler resolves once and passes the same range
+   to the ops builder, target-start/end, overlap-check and the preview."
+  [sections normalized-content heading opts]
+  (let [{:keys [occurrence level includeSubsections target-range]} opts]
+    (or target-range
+        (if includeSubsections
+          (subtree-range sections normalized-content heading
+                         {:occurrence occurrence :level level})
+          (section-anchor sections normalized-content heading
+                          {:occurrence occurrence :level level})))))
+
+(defn section-replace-ops
+  "Heading-signature wrapper over section-replace-range-ops. The range is
+   resolved once: explicit :target-range, else the subtree range when
+   :includeSubsections is set, else the plain body (:level + :occurrence
+   aware). No flags reproduces the WO-07 leaf writer byte for byte. Replacing
+   a subtree removes the children and keeps the heading line."
+  [old-content sections heading new-text opts]
+  (section-replace-range-ops
+   old-content
+   (write-range sections old-content heading opts)
+   new-text))
+
+(defn append-to-range-ops
+  "Pure insert of `text` (normalized to exactly-one-\\n block) at the end of
+   the resolved content range {:start :end}. That end is the plain section end
+   for a leaf, or the last child's end when the caller resolved a subtree, so
+   a subtree append lands after the last child. One blank line is kept before
+   the next sibling heading. Aborts :fence-split if the insert point is
+   in-fence."
+  [old-content {:keys [end]} text]
+  (assert (base/trailing-nl-valid? old-content) "append-to-range-ops needs normalized old")
   (when (str/blank? text)
     (throw (ex-info "append text is blank"
                     {:code :no-op :reason :blank-append-text})))
-  (let [{:keys [end]} (section->offsets sections old-content heading {:occurrence occurrence})
-        ;; appending at a section boundary puts us directly before the next
+  (let [;; appending at a section boundary puts us directly before the next
         ;; heading; keep a blank line so the heading stays a heading.
         block (let [b (base/normalize text)]
                 (if (< end (base/utf16-length old-content)) (str b "\n") b))]
@@ -312,6 +392,16 @@
       (pos? end) (conj [:retain end])
       :always (conj [:insert block])
       (pos? (- (base/utf16-length old-content) end)) (conj [:retain (- (base/utf16-length old-content) end)]))))
+
+(defn append-to-section-ops
+  "Heading-signature wrapper over append-to-range-ops. Same one-range
+   resolution as section-replace-ops (explicit :target-range, subtree when
+   :includeSubsections, else the plain body). No flags is unchanged from the
+   WO-07 writer."
+  [old-content sections heading text opts]
+  (append-to-range-ops old-content
+                       (write-range sections old-content heading opts)
+                       text))
 
 ;; ---------- apply ----------
 
@@ -406,6 +496,78 @@
           :insert (let [w (base/utf16-length a)]
                     (recur pos (+ npos w) (rest rs) os oe ns (+ npos w)))
           (throw (ex-info "unknown op" {:code :bad-op :op op})))))))
+
+(defn- subs-or-nil
+  "subs when [start,end] is inside s, else nil (a short actual document must
+   never compare equal by truncation)."
+  [s start end]
+  (let [n (base/utf16-length s)]
+    (when (and (<= 0 start) (<= start end) (<= end n))
+      (subs s start end))))
+
+(defn outside-equal?
+  "True when everything outside [start,end) is byte-identical pre/post.
+   An out-of-range slice on either side is nil, so a length-changing write
+   the server did not apply can never compare equal."
+  [before after start end]
+  (let [bs (subs-or-nil before 0 start)
+        as (subs-or-nil after 0 start)
+        be (subs-or-nil before end (base/utf16-length before))
+        ae (subs-or-nil after end (base/utf16-length after))]
+    (and (some? as) (some? ae) (= bs as) (= be ae))))
+
+(defn intent-matches?
+  "Pure region-intent check (SPEC §4/§5). For a write with a resolved range
+   the rule is exactly: expected[target-start..target-end] ==
+   actual[new-target-start..new-target-end] AND everything outside that range
+   is unchanged. The new span comes from affected-span, so a delete that
+   shortens the document still verifies; a subtree replace keeps the child
+   change inside the window. Never a
+   whole-doc hash, never region-lines on the range path. A range-less pre
+   falls back to the legacy heading region (level-aware)."
+  [pre actual]
+  (try
+    (let [{:keys [target-start target-end new-target-start new-target-end
+                  heading-or-nil occurrence level]} pre
+          expected (:new-content pre)
+          ;; Length-changing writes must compare the new span. A delete that
+          ;; shortens the document makes the old end out of range, so an
+          ;; applied write was reported unconfirmed.
+          start (or new-target-start target-start)
+          end (or new-target-end target-end)]
+      (if (and (some? start) (some? end) (<= start end))
+        (let [want (subs-or-nil expected start end)
+              have (subs-or-nil actual start end)]
+          (and (some? want) (some? have) (= want have)
+               (outside-equal? expected actual start end)))
+        (if (some? heading-or-nil)
+          (= (:lines (region-lines expected heading-or-nil
+                                   {:occurrence occurrence :level level}))
+             (:lines (region-lines actual heading-or-nil
+                                   {:occurrence occurrence :level level})))
+          false)))
+    (catch :default _e false)))
+
+(defn intent-pre
+  "Assemble the verification pre for a resolved write. Pure. Carries the
+   resolved range, the write options that produced it, and the affected new
+   span. `new-target-start/end` is the new side of affected-span (diagnostic;
+   it can be narrower than the target, so verification uses the resolved
+   target range only)."
+  [resolved new-content]
+  (let [{:keys [ops target-start target-end heading-or-nil occurrence level
+                include-subsections]} resolved
+        {:keys [new-start new-end]} (affected-span ops)]
+    {:ops ops
+     :target-start target-start
+     :target-end target-end
+     :new-target-start new-start
+     :new-target-end new-end
+     :heading-or-nil heading-or-nil
+     :occurrence occurrence
+     :level level
+     :include-subsections (boolean include-subsections)
+     :new-content new-content}))
 
 (defn target-range-of-ops
   "Conservative affected range of caller ops: [first-non-retain-pos, len)."
@@ -503,6 +665,72 @@
        :target-start (apply min starts)
        :target-end (apply max ends)})))
 
+(defn replace-range->ops
+  "1-based inclusive line range -> {:ops :target-start :target-end}.
+   `old-text` must equal lines start..end joined by a newline with no trailing
+   newline. A trailing LF is :bad-args; CRLF text reaches the compare and fails
+   :range-mismatch with an LF hint. The replacement consumes the newline after
+   `end`, so the target span is [line start, end-of-line + its newline) and the
+   line count may change. Non-blank `new-text` is normalized to exactly one
+   trailing newline; blank text deletes the range and never goes through
+   normalize (which maps \"\" to a lone newline). Compose, then
+   ensure-one-trailing-nl, exactly like replace-lines. Identical old/new is
+   :no-op. Pure."
+  [normalized start-line end-line old-text new-text]
+  (let [spans (line-spans normalized)
+        n (count spans)]
+    (when (or (not (.isInteger js/Number start-line))
+              (not (.isInteger js/Number end-line))
+              (< start-line 1)
+              (< end-line start-line)
+              (> end-line n))
+      (throw (ex-info (str "range out of range: " start-line ".." end-line
+                           " of " n " lines")
+                      {:code :range-out-of-range
+                       :startLine start-line :endLine end-line :line-count n})))
+    (when-not (string? old-text)
+      (throw (ex-info "replace-range needs string :oldText"
+                      {:code :bad-args :field :oldText})))
+    (when-not (string? new-text)
+      (throw (ex-info "replace-range needs string :newText"
+                      {:code :bad-args :field :newText})))
+    (when (and (str/ends-with? old-text "\n")
+               (not (str/ends-with? old-text "\r\n")))
+      (throw (ex-info "oldText must not end with a newline"
+                      {:code :bad-args :field :oldText
+                       :reason :trailing-newline
+                       :startLine start-line :endLine end-line})))
+    (let [start (:start (nth spans (dec start-line)))
+          last-end (:end (nth spans (dec end-line)))
+          actual (subs normalized start last-end)
+          crlf? (str/includes? old-text "\r")]
+      (when (not= old-text actual)
+        (throw (ex-info (str "lines " start-line ".." end-line
+                             " do not match oldText")
+                        (cond-> {:code :range-mismatch
+                                 :startLine start-line :endLine end-line
+                                 :expected old-text :actual actual}
+                          crlf? (assoc :hint (str "oldText uses CRLF line endings; "
+                                                  "the document uses LF"))))))
+      (let [end (if (< last-end (base/utf16-length normalized))
+                  (inc last-end)
+                  last-end)
+            block (if (str/blank? new-text) "" (base/normalize new-text))
+            new-content (base/ensure-one-trailing-nl
+                         (str (subs normalized 0 start)
+                              block
+                              (subs normalized end)))]
+        (when (= new-content normalized)
+          (throw (ex-info "replace-range is a no-op"
+                          {:code :no-op :reason :range-unchanged
+                           :startLine start-line :endLine end-line})))
+        (let [ops (content->ops normalized new-content)]
+          (when (empty? ops)
+            (throw (ex-info "replace-range is a no-op"
+                            {:code :no-op :reason :range-unchanged
+                             :startLine start-line :endLine end-line})))
+          {:ops ops :target-start start :target-end end})))))
+
 (defn insert-lines->ops
   "Insert normalized `text` before 1-based `line` (line = n+1 appends).
    Returns {:ops :target-start :target-end}; target is a point."
@@ -561,8 +789,13 @@
 
 (defn resolve-ops
   "Build-or-validate op vector. Returns {:ops :target-start :target-end
-   :heading-or-nil :occurrence}. Throws ex-info with :code on failure."
-  [snap-content {:keys [ops new-section-text heading occurrence target-range]}]
+   :heading-or-nil :occurrence :level :include-subsections}. Throws ex-info
+   with :code on failure. new-section-text resolves its range ONCE: the same
+   range feeds the ops, target-start/end, overlap-check and the dry-run
+   preview (subtree-range when :includeSubsections is set, else the plain
+   body)."
+  [snap-content {:keys [ops new-section-text heading occurrence level
+                        includeSubsections target-range]}]
   (cond
     (and ops new-section-text)
     (throw (ex-info ":ops and :new-section-text are exclusive"
@@ -574,22 +807,25 @@
           (throw (ex-info "empty op list is a no-op"
                           {:code :no-op :reason :empty-op-list-no-state-change})))
         (let [[s e] (or target-range (target-range-of-ops snap-content ops))]
-          {:ops ops :target-start s :target-end e :heading-or-nil nil :occurrence nil}))
+          {:ops ops :target-start s :target-end e :heading-or-nil nil
+           :occurrence nil :level nil :include-subsections false}))
 
     new-section-text
     (do (when (or (not (string? heading)) (str/blank? heading))
           (throw (ex-info "new-section-text needs :heading" {:code :bad-args :field :heading})))
         (let [sections (parse-sections snap-content)
-              computed (section-replace-ops snap-content sections heading new-section-text
-                                           {:occurrence occurrence})
-              {:keys [start end]} (section->offsets sections snap-content heading
-                                                   {:occurrence occurrence})]
+              anchor {:occurrence occurrence :level level}
+              range (if includeSubsections
+                      (subtree-range sections snap-content heading anchor)
+                      (section-anchor sections snap-content heading anchor))
+              computed (section-replace-range-ops snap-content range new-section-text)]
           (when (empty? computed)
             (throw (ex-info "empty op list is a no-op"
                             {:code :no-op :reason :empty-op-list-no-state-change
                              :heading heading :occurrence occurrence})))
-          {:ops computed :target-start start :target-end end
-           :heading-or-nil heading :occurrence occurrence}))
+          {:ops computed :target-start (:start range) :target-end (:end range)
+           :heading-or-nil heading :occurrence occurrence :level level
+           :include-subsections (boolean includeSubsections)}))
 
     :else
     (throw (ex-info "need :ops or :new-section-text"

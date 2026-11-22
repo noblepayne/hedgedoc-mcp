@@ -11,7 +11,7 @@ buildNpmPackage {
   src = ./.;
 
   # Refresh with: nix run nixpkgs#prefetch-npm-deps -- package-lock.json
-  npmDepsHash = "sha256-JFb3Fx3UbLVL4pg+DeRUHMoi9qe69/3b4h8iMylmvL0=";
+  npmDepsHash = "sha256-hIjFlNYNP+5/d5gCqbwq4LnDdpJdAiz4TSWsmZQiFbc=";
 
   nativeBuildInputs = [nodejs makeWrapper];
 
@@ -30,6 +30,9 @@ buildNpmPackage {
     node test/error-shape.mjs
     node test/model-subtree.mjs
     node test/affected-span.mjs
+    node test/intent.mjs
+    node test/section-boundary.mjs
+    node test/replace-range.mjs
     node test/pbt-1-gens.mjs
     node test/pbt-2-transform.mjs --runs 300
     node test/pbt-3-invariants.mjs

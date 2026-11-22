@@ -10,7 +10,7 @@
                                         :default 0}}
                   :additionalProperties false}}
    {:name "read-section"
-    :description "Scoped read of one section by heading (case/space-insensitive anchor; :occurrence selects among duplicates; :level 1..6 filters to that heading level with no fallback). includeSubsections reads from after the heading line to the next heading at or above that level, and returns writeRoundTrip false + a hint because section writes still cover the body only. Returns rev, hash, content slice, UTF-16 offsets. Read-only."
+    :description "Scoped read of one section by heading (case/space-insensitive anchor; :occurrence selects among duplicates; :level 1..6 filters to that heading level with no fallback). includeSubsections reads from after the heading line to the next heading at or above that level and returns writeRoundTrip true plus the echoed anchor (heading, level, occurrence, includeSubsections) so the slice can be written back: pass includeSubsections true to apply-ops with new-section-text, or to append-to-section. The heading line is always preserved. Returns rev, hash, content slice, UTF-16 offsets. Read-only."
     :inputSchema {:type "object"
                   :properties {:heading {:type "string"}
                                :occurrence {:type "integer" :minimum 0}
@@ -27,7 +27,7 @@
                                           :default "all"}}
                   :additionalProperties false}}
    {:name "apply-ops"
-    :description "CAS-gated write. Either caller :ops ([[tag value]] pairs, tag in retain/delete/insert, UTF-16 units, grapheme-safe, result under 100KB) or :new-section-text with :heading (replaces the section BODY only; the heading line is preserved, so do not include it in the text). Needs :base-rev + :base-hash from a fresh read; stale rejects with server rev/hash. :dryRun returns a numbered preview without emitting; :preview \"window\" (default, +-6 lines around the target), \"region\" (the whole affected range), or \"tail\" (the last 12 lines of it), capped at 200 lines / 4000 UTF-16 units."
+    :description "CAS-gated write. Either caller :ops ([[tag value]] pairs, tag in retain/delete/insert, UTF-16 units, grapheme-safe, result under 100KB) or :new-section-text with :heading (replaces the section body only; the heading line is preserved, so do not include it in the text). Add includeSubsections true to replace the whole subtree instead (children included, heading line still preserved); :level 1..6 qualifies the heading when the same name exists at several levels. Include-flag rules: includeSubsections/:level are bad-args with raw :ops. Needs :base-rev + :base-hash from a fresh read; stale rejects with server rev/hash. :dryRun returns a numbered preview without emitting; :preview \"window\" (default, +-6 lines around the target), \"region\" (the whole affected range), or \"tail\" (the last 12 lines of it), capped at 200 lines / 4000 UTF-16 units."
     :inputSchema {:type "object"
                   :properties {:base-rev {:type "integer"}
                                :base-hash {:type "string"}
@@ -35,6 +35,8 @@
                                :new-section-text {:type "string"}
                                :heading {:type "string"}
                                :occurrence {:type "integer" :minimum 0}
+                               :level {:type "integer" :minimum 1 :maximum 6}
+                               :includeSubsections {:type "boolean" :default false}
                                :dryRun {:type "boolean"}
                                :preview {:enum ["window" "region" "tail"]
                                          :default "window"}
@@ -42,13 +44,15 @@
                   :required ["base-rev" "base-hash"]
                   :additionalProperties false}}
    {:name "append-to-section"
-    :description "Pure insert of :text at the end of :heading's section (before the next heading). Same CAS/overlap/retry core as apply-ops; no separate path. :dryRun returns a numbered preview of the insertion; :preview picks window (+-6 lines around the target), region (the inserted block), or tail (its last 12 lines)."
+    :description "Pure insert of :text at the end of :heading's section (before the next heading). includeSubsections true appends after the last child of that subtree, keeping the blank line before the next sibling; :level 1..6 qualifies the heading. Same CAS/overlap/retry core as apply-ops; no separate path. :dryRun returns a numbered preview of the insertion; :preview picks window (+-6 lines around the target), region (the inserted block), or tail (its last 12 lines)."
     :inputSchema {:type "object"
                   :properties {:heading {:type "string"}
                                :base-rev {:type "integer"}
                                :base-hash {:type "string"}
                                :text {:type "string"}
                                :occurrence {:type "integer" :minimum 0}
+                               :level {:type "integer" :minimum 1 :maximum 6}
+                               :includeSubsections {:type "boolean" :default false}
                                :dryRun {:type "boolean"}
                                :preview {:enum ["window" "region" "tail"]
                                          :default "window"}
@@ -97,6 +101,21 @@
                                          :default "window"}
                                :verify {:type "boolean"}}
                   :required ["base-rev" "base-hash" "line"]
+                  :additionalProperties false}}
+   {:name "replace-range"
+    :description "Replace an explicit line range (1-based, inclusive startLine..endLine) with newText, which may be multi-line. oldText must equal the current lines startLine..endLine joined by LF with no trailing newline: a mismatch is range-mismatch with expected/actual, a bad range is range-out-of-range, and a trailing newline in oldText is bad-args. The replacement consumes the newline after endLine, so line counts may change. Empty or whitespace-only newText deletes the range (deleting the whole document leaves a one-line blank document); identical old/new is a no-op. Same CAS/overlap/verify core as replace-lines; supports :dryRun, :preview (window/region/tail) and :verify false."
+    :inputSchema {:type "object"
+                  :properties {:base-rev {:type "integer"}
+                               :base-hash {:type "string"}
+                               :startLine {:type "integer" :minimum 1}
+                               :endLine {:type "integer" :minimum 1}
+                               :oldText {:type "string"}
+                               :newText {:type "string"}
+                               :dryRun {:type "boolean"}
+                               :preview {:enum ["window" "region" "tail"]
+                                         :default "window"}
+                               :verify {:type "boolean"}}
+                  :required ["base-rev" "base-hash" "startLine" "endLine" "oldText" "newText"]
                   :additionalProperties false}}
    {:name "search"
     :description "Read-only line search: substring or regex, case-insensitive by default. Returns matching lines with 1-based line numbers, a truncated flag and the current rev/hash."

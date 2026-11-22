@@ -132,8 +132,9 @@ check('S1 orientation', () => {
   assert(base.length > 0, 'missing length');
 });
 
-// S1b subtree read: includeSubsections walks past child headings; the default
-// read still stops at the first child and must not grow the write marker.
+// S1b subtree read: includeSubsections walks past child headings and is now a
+// writable anchor (writeRoundTrip true + the echoed anchor). The default read
+// still stops at the first child and must not grow the write marker.
 const secs = base.sections || [];
 const parentIdx = secs.findIndex((s, i) => s.level > 1 && secs[i + 1] && secs[i + 1].level > s.level);
 const subQ = parentIdx >= 0
@@ -146,13 +147,33 @@ const plainRead = subQ
   : null;
 check('S1b subtree read includes children; default read unchanged', () => {
   assert(subQ && subRead, 'no section with a nested child heading found');
-  assert(subRead.writeRoundTrip === false, `writeRoundTrip=${subRead.writeRoundTrip}`);
+  assert(subRead.writeRoundTrip === true, `writeRoundTrip=${subRead.writeRoundTrip}`);
+  assert(subRead.heading === subQ.heading && subRead.level === subQ.level
+    && subRead.occurrence === subQ.occurrence && subRead.includeSubsections === true,
+    `anchor not echoed: ${JSON.stringify(subRead)}`);
   assert(typeof subRead.hint === 'string' && subRead.hint.length > 0, 'no subtree hint');
   assert(plainRead.writeRoundTrip === undefined, 'writeRoundTrip leaked into a default read');
   assert(subRead.start === plainRead.start, 'subtree start moved');
   assert(subRead.content.startsWith(plainRead.content), 'subtree must extend the default body');
   assert(subRead.end >= plainRead.end, 'subtree end did not advance');
   assert(subRead.content.includes(secs[parentIdx + 1].heading), 'child heading missing from subtree');
+});
+
+// S1d write-flag validation: subtree flags belong to new-section-text only,
+// and level is bounded 1..6 in the read, apply-ops and append handlers.
+// dryRun keeps this check harmless if a handler ever stops rejecting.
+const badLevel = await call('read-section', { heading: secs[0].heading, level: 9 });
+const rawFlag = await call('apply-ops', { 'base-rev': st.rev, 'base-hash': baseHash,
+  ops: [['retain', 1]], includeSubsections: true, dryRun: true });
+const rawLevel = await call('apply-ops', { 'base-rev': st.rev, 'base-hash': baseHash,
+  ops: [['retain', 1]], level: 2, dryRun: true });
+const appendBadLevel = await call('append-to-section', { 'base-rev': st.rev, 'base-hash': baseHash,
+  heading: secs[0].heading, text: 'x', level: 9, dryRun: true });
+check('S1d subtree flags: level 9 and raw ops + flags are bad-args', () => {
+  assert(badLevel.code === 'bad-args', `read level 9 -> ${badLevel.code}`);
+  assert(rawFlag.code === 'bad-args' && rawLevel.code === 'bad-args',
+    `raw ops + flags -> ${rawFlag.code}/${rawLevel.code}`);
+  assert(appendBadLevel.code === 'bad-args', `append level 9 -> ${appendBadLevel.code}`);
 });
 
 // S1c read-note section modes: "all" (default), "none", "window". The window
@@ -396,6 +417,52 @@ check('S9 insert/search/delete', () => {
   assert(re9.matches && re9.matches.length === 1, 'canonical regex/caseSensitive search failed');
   assert(['download-poll', 'ack'].includes(del9.verified), 'delete not verified');
   assert(gone9.matches.length === 0, 'insert line survived delete');
+});
+
+// S12 subtree append + replace
+const boost = await call('read-section', { heading: 'Picks', includeSubsections: true });
+const subtreeMarker = '+ subtree append marker';
+const app12 = await write('append-to-section',
+  st => ({ 'base-rev': st.rev, 'base-hash': st.hash, heading: 'Picks',
+           includeSubsections: true, text: subtreeMarker }),
+  c => c.includes(subtreeMarker));
+const mid12 = await call('read-section', { heading: 'Picks', includeSubsections: true });
+const res12 = await write('apply-ops',
+  st => ({ 'base-rev': st.rev, 'base-hash': st.hash, heading: 'Picks',
+           'new-section-text': boost.content, includeSubsections: true }),
+  c => !c.includes(subtreeMarker));
+const back12 = await call('read-section', { heading: 'Picks', includeSubsections: true });
+check('S12 subtree append + replace', () => {
+  assert(boost.writeRoundTrip === true, 'subtree read did not advertise writeRoundTrip');
+  assert(['download-poll', 'ack'].includes(app12.verified), 'subtree append not verified');
+  assert(String(mid12.content).includes(subtreeMarker), 'subtree marker missing');
+  assert(String(mid12.content).includes('### [Pick: Example Tool]'), 'subtree read lost a child');
+  assert(['download-poll', 'ack'].includes(res12.verified), 'subtree restore not verified');
+  assert(norm(back12.content) === norm(boost.content), 'subtree not restored');
+});
+
+// S13 replace-range multi-line
+const rr0 = await call('read-note');
+const rrLines = rr0.content.split('\n');
+const rrLine = rrLines.findIndex(l => l.startsWith('+ ')) + 1;
+const rrOld = rrLines[rrLine - 1];
+const rrNew = `${rrOld} [rr1]\n${rrOld} [rr2]`;
+const rr1 = await write('replace-range',
+  st => ({ 'base-rev': st.rev, 'base-hash': st.hash, startLine: rrLine, endLine: rrLine,
+           oldText: rrOld, newText: rrNew }),
+  c => c.includes('[rr1]') && c.includes('[rr2]'));
+const rrMid = await call('read-note');
+const rrRestore = await write('replace-range',
+  st => ({ 'base-rev': st.rev, 'base-hash': st.hash, startLine: rrLine, endLine: rrLine + 1,
+           oldText: `${rrOld} [rr1]\n${rrOld} [rr2]`, newText: rrOld }),
+  c => !c.includes('[rr1]') && !c.includes('[rr2]'));
+const rrBack = await call('read-note');
+check('S13 replace-range multi-line', () => {
+  assert(Number.isInteger(rrLine) && rrLine > 0, 'no target line');
+  assert(['download-poll', 'ack'].includes(rr1.verified), 'replace-range not verified');
+  assert(rrMid['total-lines'] === rr0['total-lines'] + 1, 'replace-range did not add a line');
+  assert(['download-poll', 'ack'].includes(rrRestore.verified), 'replace-range restore not verified');
+  assert(rrBack['total-lines'] === rr0['total-lines'], 'line count not restored');
 });
 
 // S9 integrity

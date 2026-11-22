@@ -26,7 +26,7 @@ Unofficial client. Not affiliated with or endorsed by the HedgeDoc project.
 
 | Item | State |
 |---|---|
-| Version | `0.2.2` |
+| Version | `0.2.3` |
 | HedgeDoc 1.12 | Tested |
 | HedgeDoc 1.11 | Expected to work, not exercised yet |
 | HedgeDoc 1.10 and older | Refused at connect (they use Socket.IO 2) |
@@ -275,11 +275,12 @@ decide; a blind re-emit can duplicate the edit.
 | Tool | What it does |
 |---|---|
 | `get-status` | Reports revision, hash, headings, idle time, rev velocity, auth kind, connection state, and `writable`. `waitMs` waits for boot and reports `waitedMs`. |
-| `read-section` | Returns one heading's content with UTF-16 offsets. `occurrence` picks among duplicate headings, `level` narrows by heading level, and `includeSubsections` reads the whole subtree. |
+| `read-section` | Returns one heading's content with UTF-16 offsets. `occurrence` picks among duplicate headings, `level` narrows by heading level, and `includeSubsections` reads the whole subtree. A subtree read can be written back with the same flags. |
 | `read-note` | Returns the note, or a page of lines, with front matter and heading line numbers. `sections` controls the heading list. |
-| `apply-ops` | Writes raw ops under CAS, or replaces a section body via `new-section-text` plus `heading`. |
-| `append-to-section` | Inserts a block at the end of a section, before the next heading. |
-| `replace-lines` | Applies batch 1-based line edits with an `old` match, bottom-up. |
+| `apply-ops` | Writes raw ops under CAS, or replaces a section body via `new-section-text` plus `heading`. `includeSubsections` replaces the whole subtree. |
+| `append-to-section` | Inserts a block at the end of a section, before the next heading. `includeSubsections` appends after the last child. |
+| `replace-lines` | Applies batch single-line edits with an `old` match, bottom-up. |
+| `replace-range` | Replaces a 1-based line range with one or more lines, exact `oldText`, one CAS write. |
 | `insert-lines` | Inserts before a line. `total+1` appends. |
 | `delete-lines` | Deletes a line range, one line by default. Refuses to run past the end of the note. |
 | `search` | Searches lines by substring or regex, case insensitive by default. |
@@ -293,9 +294,10 @@ decide; a blind re-emit can duplicate the edit.
 |---|---|---|
 | `note-id` | Every tool except `list-notes`, in the multi-note binary | Selects the worker. The single-note `core.mjs` rejects it. |
 | `waitMs` | `get-status` | Integer 0..15000, default 0. Waits up to that many ms for boot to land, then returns the status with `waitedMs`. Costs wall-clock time on the call. |
-| `level`, `includeSubsections` | `read-section` | `level` is 1..6 and filters without a fallback. `includeSubsections: true` reads from after the heading line to the next heading at or above that level, or to the document end. That read adds `writeRoundTrip: false` and a hint. |
+| `level`, `includeSubsections` | `read-section`, `apply-ops`, `append-to-section` | `level` is 1..6 and filters without a fallback. `includeSubsections: true` reads or writes from after the heading line to the next heading at or above that level, or to the document end. A subtree read returns `writeRoundTrip: true` and echoes the anchor. Raw ops plus either flag is `bad-args`. |
 | `sections` | `read-note` | `"all"` (default), `"none"`, or `"window"` for headings inside the returned slice. A boolean is rejected with a hint to use `"none"`. `get-status` still returns every heading. |
 | `base-rev`, `base-hash` | Every write | Taken from a fresh read. A stale base is refused. |
+| `startLine`, `endLine`, `oldText`, `newText` | `replace-range` | Inclusive 1-based range. `oldText` is the lines joined by `\n`, no trailing newline. `newText` may be multi-line; blank deletes the range. |
 | `dryRun` | Write tools | Returns a numbered preview with `status: dry-run` and `written: false`, and emits nothing. Aliases: `dry-run`, `dry_run`, `dry-run?`. |
 | `preview` | `apply-ops`, `append-to-section`, `replace-lines`, `insert-lines`, `delete-lines` | Dry-run only: `"window"` (default, six-line radius around the target), `"region"` (the whole affected range), or `"tail"` (its last 12 lines). `set-note` does not take it. |
 | `verify` | Write tools | `false` skips the download poll and reports `verified: ack` once the revision has advanced and the intended content is visible locally. Alias: `verify?`. |
@@ -322,7 +324,8 @@ then the write. On `stale-revision`, read again and use the new rev and hash. On
 | `applied-but-unconfirmed` | Re-read before doing anything else. Do not re-emit blindly. |
 | `emit-in-flight` | Another write is running. Wait for it to finish. |
 | `write-needs-user` | You are a guest. Use the bot account. |
-| `writeRoundTrip: false` on a read | That read included subsections. Subtree writes are not supported yet, so edit the body without `includeSubsections`. |
+| `range-mismatch` | `oldText` is not the current text of those lines. Read again and rebuild it. CRLF input fails with an LF hint. |
+| `range-out-of-range` | `startLine`/`endLine` are inverted or outside the note. Read the line count and retry. |
 | 401 or `unauthorized` | Check the email, password, or cookie. |
 | `oversize` | The write would pass 100 KB. Split it or edit a smaller region. |
 | `download-failed` | Check `HEDGEDOC_URL`, the note id, the cookie, and reachability. |
@@ -335,17 +338,18 @@ then the write. On `stale-revision`, read again and use the new rev and hash. On
 - ATX headings and backtick fences are recognized. Setext headings and `~~~`
   fences are not. An indented ATX heading is not recognized either, so it does
   not end a subtree read.
-- A subtree read is read-only. Subtree writes are not supported yet, so
-  `apply-ops` `new-section-text` and `append-to-section` still replace or append
-  the section body only. A subtree read returns `writeRoundTrip: false` as a
-  warning not to feed it back as a body.
+- A subtree append lands after the last child, so the added text reads as part
+  of that child. That is inherent to the requested semantics; use the child
+  heading directly if the text belongs to the parent.
 - `length` counts the returned lines joined by `\n`, excluding the newline that
   ends the last returned line. `doc-length` includes the single trailing
   newline. `read-section` includes that newline when the section is last.
-- `new-section-text` is inserted verbatim after the heading line. A body
-  starting with `-` therefore removes the blank line that normally separates
-  heading from body. No normalization runs, so include a leading blank line in
-  the text when you want one.
+- `new-section-text` constructs one blank line after the heading, then the body
+  with leading and trailing blank lines stripped. A body starting with `-`, `+`,
+  text, or a fence keeps the conventional blank line. Empty text produces only
+  that blank line, or `## H` followed by the next heading when the section is
+  last. A read-then-restore is stable after one pass; the second restore is a
+  `no-op`.
 - There is no undo. HedgeDoc's own history is the recovery path.
 - HedgeDoc 2 is not supported.
 - `search` with `regex: true` uses JavaScript's backtracking engine. A

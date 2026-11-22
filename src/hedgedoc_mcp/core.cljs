@@ -48,7 +48,7 @@
 ;; ---------------- constants ----------------
 
 (def server-name "hedgedoc-mcp")
-(def server-version "0.2.2")
+(def server-version "0.2.3")
 (def mcp-protocol-version "2024-11-05")
 
 (def default-idle-ms 30000)
@@ -716,6 +716,31 @@
                                       (boolean (:verify args))
                                       true)})))
 
+(defn- handle-replace-range [args]
+  (let [env @env_
+        base-rev (checked-int args :base-rev)
+        base-hash (checked-str args :base-hash)
+        start-line (checked-int args :startLine)
+        end-line (checked-int args :endLine)
+        old-text (:oldText args)
+        new-text (:newText args)]
+    (when-not (string? old-text)
+      (throw (ex-info "oldText must be a string"
+                      {:code :bad-args :field :oldText :got old-text})))
+    (when-not (string? new-text)
+      (throw (ex-info "newText must be a string"
+                      {:code :bad-args :field :newText :got new-text})))
+    (require-state! env)
+    (connected-check! env)
+    (tools/replace-range env {:base-rev base-rev :base-hash base-hash
+                              :startLine start-line :endLine end-line
+                              :oldText old-text :newText new-text
+                              :preview (:preview args)
+                              :dryRun (boolean (:dryRun args))
+                              :verify (if (contains? args :verify)
+                                        (boolean (:verify args))
+                                        true)})))
+
 (defn- handle-insert-lines [args]
   (let [env @env_
         base-rev (checked-int args :base-rev)
@@ -781,12 +806,18 @@
         base-rev (checked-int args :base-rev)
         base-hash (checked-str args :base-hash)
         has-ops? (contains? args :ops)
-        has-text? (contains? args :new-section-text)]
+        has-text? (contains? args :new-section-text)
+        has-subtree-flag? (or (contains? args :includeSubsections)
+                              (contains? args :level))]
     (when (and has-ops? has-text?)
       (throw (ex-info ":ops and :new-section-text are exclusive"
                       {:code :bad-args :reason ":ops and :new-section-text are exclusive"})))
     (when (and (not has-ops?) (not has-text?))
       (throw (ex-info "need :ops or :new-section-text" {:code :bad-args})))
+    (when (and has-ops? has-subtree-flag?)
+      (throw (ex-info "includeSubsections/level need :new-section-text, not raw :ops"
+                      {:code :bad-args
+                       :reason "raw ops are already resolved; subtree flags apply to :new-section-text only"})))
     (let [eff (cond-> {:base-rev base-rev
                        :base-hash base-hash
                        :heading (:heading args)
@@ -799,7 +830,9 @@
                                                      {:code :bad-args
                                                       :field :new-section-text
                                                       :got v})))
-                                   v))
+                                   v)
+                           :includeSubsections (true? (:includeSubsections args))
+                           :level (checked-level args))
                 (:dryRun args) (assoc :dryRun (boolean (:dryRun args)))
                 (some? (:preview args)) (assoc :preview (:preview args))
                 (contains? args :verify) (assoc :verify (boolean (:verify args))))]
@@ -825,6 +858,8 @@
     (tools/append-to-section env {:heading heading :text text
                                   :base-rev base-rev :base-hash base-hash
                                   :occurrence occurrence
+                                  :level (checked-level args)
+                                  :includeSubsections (true? (:includeSubsections args))
                                   :preview (:preview args)
                                   :dryRun (boolean (:dryRun args))
                                   :verify (if (contains? args :verify)
@@ -867,6 +902,7 @@
    "apply-ops" handle-apply-ops
    "append-to-section" handle-append-to-section
    "replace-lines" handle-replace-lines
+   "replace-range" handle-replace-range
    "insert-lines" handle-insert-lines
    "delete-lines" handle-delete-lines
    "search" handle-search
@@ -897,7 +933,11 @@
    :case-sensitive :caseSensitive
    :case_sensitive :caseSensitive
    :case-sensitive? :caseSensitive
-   :caseSensitive? :caseSensitive})
+   :caseSensitive? :caseSensitive
+   :start-line :startLine
+   :end-line :endLine
+   :old-text :oldText
+   :new-text :newText})
 
 (defn- normalize-args [args]
   (reduce (fn [m [k v]]

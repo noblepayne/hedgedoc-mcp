@@ -26,49 +26,6 @@
 
 ;; ---------- small helpers ----------
 
-(defn- lines-of [s] (str/split-lines s))
-
-(defn- region-lines
-  "Target line-region of a section heading in content, for intent checks.
-   Occurrence is threaded (single implementation)."
-  [content heading occurrence]
-  (let [sections (ops/parse-sections content)
-        {:keys [start end]} (ops/section->offsets sections content heading
-                                                  {:occurrence occurrence})
-        body (subs content start end)]
-    {:start start :end end :lines (lines-of body)}))
-
-(defn- outside-equal?
-  "True when everything outside [start,end) is byte-identical pre/post."
-  [before after start end]
-  (and (= (subs before 0 start) (subs after 0 start))
-       (= (subs before end) (subs after end))))
-
-(defn- safe-subs [s start end]
-  (try
-    (subs s start (min end (m/utf16-length s)))
-    (catch :default _e nil)))
-
-(defn- region-intent?
-  "Spec §4/§5 region-intent check: target lines/span as expected AND
-   everything outside the target unchanged.  Region-scoped equality, never a
-   whole-doc hash under concurrency."
-  [pre actual]
-  (try
-    (let [{:keys [target-start target-end heading-or-nil occurrence
-                  new-target-start new-target-end]} pre
-          expected (:new-content pre)]
-      (if heading-or-nil
-        (let [want (:lines (region-lines expected heading-or-nil occurrence))
-              have (:lines (region-lines actual heading-or-nil occurrence))]
-          (and (= want have)
-               (outside-equal? expected actual target-start target-end)))
-        (let [ns (or new-target-start target-start)
-              ne (or new-target-end target-end)]
-          (and (= (safe-subs expected ns ne) (safe-subs actual ns ne))
-               (outside-equal? expected actual ns ne)))))
-    (catch :default _ false)))
-
 (defn- download-content
   "One read-only /download.  Accepts either the env map {:content s} or a
    raw string from a fake/test env."
@@ -92,7 +49,7 @@
                 (-> (download-content fetch-download)
                     (.then (fn [actual]
                              (cond
-                               (region-intent? pre actual)
+                               (ops/intent-matches? pre actual)
                                {:ok true :content actual :attempts (inc attempt)}
 
                                (>= attempt (dec max-polls))
@@ -192,8 +149,9 @@
 (defn read-section
   "{:heading :occurrence? :level? :includeSubsections?} => {:rev :hash :content
    :start :end}. Scoped read; with :includeSubsections the slice runs to the
-   next heading at or above the target's level. writeRoundTrip: false and the
-   hint are added ONLY for a subtree read, so the default shape is unchanged."
+   next heading at or above the target's level. writeRoundTrip: true, the
+   echoed anchor and the hint are added ONLY for a subtree read, so the default
+   shape is unchanged."
   [{:keys [state]} {:keys [heading occurrence level includeSubsections]}]
   (when (or (not (string? heading)) (str/blank? heading))
     (throw (err :bad-args {:field :heading :got heading})))
@@ -207,8 +165,12 @@
     (cond-> {:rev (:rev v) :hash (st/content-hash v)
              :content (subs content start end) :start start :end end}
       includeSubsections
-      (assoc :writeRoundTrip false
-             :hint "subtree read is read-only until subtree writes land: apply-ops new-section-text and append-to-section still replace/append the section body only, so writing this parent body back would drop its child headings"))))
+      (assoc :writeRoundTrip true
+             :heading heading
+             :level level
+             :occurrence occurrence
+             :includeSubsections true
+             :hint "subtree slice includes child headings: pass includeSubsections true to apply-ops with new-section-text (or to append-to-section) to write it back; the heading line is preserved"))))
 
 ;; ---------- preview + line helpers ----------
 
@@ -481,13 +443,12 @@
                             :reason :rev-moved-pre-emit}))))
        (let [tail (st/tail state)
              wire-ops (cond-> (:ops resolved) (pos? tail) (conj [:retain tail]))
-             pre {:snap snap
-                  :ops wire-ops
-                  :target-start (:target-start resolved)
-                  :target-end (:target-end resolved)
-                  :heading-or-nil (:heading resolved)
-                  :occurrence (:occurrence resolved)
-                  :new-content new-content}]
+             ;; Intent pre carries the range resolve-ops picked (subtree range
+             ;; when :include-subsections), the resolved write options, and the
+             ;; expected content. Nothing is resolved twice.
+             pre (assoc (ops/intent-pre resolved new-content)
+                        :snap snap
+                        :ops wire-ops)]
          (when (some? @inflight)
            (throw (err :emit-in-flight {:op-id (:op-id @inflight)})))
          (when (:clear-doc-reset! env) ((:clear-doc-reset! env)))
@@ -576,7 +537,9 @@
 ;; ---------- 3. apply-ops ----------
 
 (defn apply-ops
-  "{:base-rev :base-hash :ops|:new-section-text :heading? :occurrence? :dryRun}
+  "{:base-rev :base-hash :ops|:new-section-text :heading? :occurrence? :level?
+    :includeSubsections? :dryRun}. includeSubsections/level apply to
+   new-section-text only (the handler rejects them with raw ops).
    Dry-run returns {:dry-run true :new-rev :new-hash :preview :ops}."
   [{:keys [connected?] :as env} {:keys [base-rev base-hash dryRun] :as args}]
   (when (or (not (integer? base-rev)) (not (string? base-hash)))
@@ -591,9 +554,15 @@
 ;; ---------- 4. append-to-section ----------
 
 (defn append-to-section
-  "{:heading :base-rev :base-hash :text :occurrence? :dryRun :verify :preview}"
+  "{:heading :base-rev :base-hash :text :occurrence? :level? :includeSubsections?
+    :dryRun :verify :preview}
+   The range is resolved ONCE: the subtree range when :includeSubsections is
+   set, else the plain body (:level + :occurrence aware). The same range feeds
+   the ops (append lands at its end, after the last child for a subtree),
+   :target-range (overlap-check and the dry-run preview), and never falls back
+   to a suffix."
   [{:keys [connected?] :as env} {:keys [heading base-rev base-hash text occurrence
-                                        dryRun verify preview]}]
+                                        level includeSubsections dryRun verify preview]}]
   (when (or (not (string? heading)) (str/blank? heading))
     (throw (err :bad-args {:field :heading :got heading})))
   (when (not (string? text))
@@ -605,11 +574,16 @@
     (throw (err :not-connected {})))
   (let [snap (st/snapshot-for-cas (:state env))]
     (ops/cas-check snap base-rev base-hash)
-    (let [sections (ops/parse-sections (:content snap))
-          computed (ops/append-to-section-ops
-                    (:content snap) sections heading text {:occurrence occurrence})]
+    (let [content (:content snap)
+          sections (ops/parse-sections content)
+          range (ops/write-range sections content heading
+                                 {:occurrence occurrence :level level
+                                  :includeSubsections includeSubsections})
+          computed (ops/append-to-range-ops content range text)]
       (emit-with-cas! env
-                      {:ops computed :verify? verify :preview preview}
+                      {:ops computed
+                       :target-range [(:start range) (:end range)]
+                       :verify? verify :preview preview}
                       {:op-id (str (random-uuid))
                        :base-rev base-rev :base-hash base-hash
                        :dry-run? (boolean dryRun)}))))
@@ -634,6 +608,31 @@
     (emit-with-cas! env
                     {:ops ops :target-range [target-start target-end]
                      :verify? verify :preview preview}
+                      {:op-id (str (random-uuid))
+                       :base-rev base-rev :base-hash base-hash
+                       :dry-run? (boolean dryRun)}))))
+
+(defn replace-range
+  "{:base-rev :base-hash :startLine :endLine :oldText :newText :dryRun
+    :verify :preview} Replace 1-based inclusive lines startLine..endLine with
+   newText (may be multi-line; blank deletes the range). oldText is the exact
+   current text of those lines joined by a newline with no trailing newline.
+   One CAS write, one rev bump."
+  [{:keys [connected?] :as env}
+   {:keys [base-rev base-hash startLine endLine oldText newText dryRun verify preview]}]
+  (when (or (not (integer? base-rev)) (not (string? base-hash)))
+    (throw (err :bad-args {:fields [:base-rev :base-hash]})))
+  (write-auth-check! env)
+  (when (not (connected?))
+    (throw (err :not-connected {})))
+  (let [snap (st/snapshot-for-cas (:state env))]
+    (ops/cas-check snap base-rev base-hash)
+    (let [{:keys [ops target-start target-end]}
+          (ops/replace-range->ops (:content snap) startLine endLine
+                                  oldText newText)]
+      (emit-with-cas! env
+                      {:ops ops :target-range [target-start target-end]
+                       :verify? verify :preview preview}
                       {:op-id (str (random-uuid))
                        :base-rev base-rev :base-hash base-hash
                        :dry-run? (boolean dryRun)}))))

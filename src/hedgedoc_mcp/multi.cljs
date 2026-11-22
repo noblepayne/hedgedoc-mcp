@@ -10,7 +10,7 @@
             ["node:url" :refer [fileURLToPath]]))
 
 (def server-name "hedgedoc-mcp")
-(def server-version "0.2.2")
+(def server-version "0.2.3")
 (def mcp-protocol-version "2024-11-05")
 
 (defonce children (atom {}))

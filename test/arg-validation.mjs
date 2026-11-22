@@ -70,6 +70,28 @@ try {
     edits: [{ line: 1, old: 'a', new: 'b' }], preview: 'region',
   });
   check(okPreview.code !== 'bad-args', `valid preview enum clears validation (${okPreview.code})`);
+  // replace-range: enum, argument aliases, and a positive dispatch that is
+  // neither unknown-tool nor bad-args (proves handler + schema wiring).
+  const badRangePreview = await call(9, 'replace-range', {
+    'base-rev': 0, 'base-hash': 'x', startLine: 1, endLine: 1,
+    oldText: 'a', newText: 'b', preview: 'bogus',
+  });
+  check(badRangePreview.code === 'bad-args' && badRangePreview.data?.field === 'preview'
+    && Array.isArray(badRangePreview.data?.allowed)
+    && badRangePreview.data.allowed.includes('tail'),
+    `replace-range bad preview enum is bad-args (${badRangePreview.code})`);
+  const aliased = await call(10, 'replace-range', {
+    'base-rev': 0, 'base-hash': 'x', 'start-line': 1, 'end-line': 1,
+    'old-text': 'a', 'new-text': 'b',
+  });
+  check(aliased.code !== 'bad-args' && aliased.code !== 'unknown-tool',
+    `replace-range aliases clear validation (${aliased.code})`);
+  const wired = await call(11, 'replace-range', {
+    'base-rev': 0, 'base-hash': 'x', startLine: 1, endLine: 1,
+    oldText: 'a', newText: 'b',
+  });
+  check(wired.code !== 'bad-args' && wired.code !== 'unknown-tool',
+    `replace-range is dispatched, not unknown-tool/bad-args (${wired.code})`);
 } catch (e) {
   check(false, String(e));
 } finally {

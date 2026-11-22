@@ -161,19 +161,19 @@ check('dry-run result keeps written false and never sets new-rev', () => {
   assert(!/:new-rev/.test(block), 'dry-run branch sets new-rev');
   assert(/preview-dry-run/.test(block), 'dry-run did not route through preview-dry-run');
 });
-check('schema declares preview on exactly the five dry-run write tools', () => {
+check('schema declares preview on exactly the six dry-run write tools', () => {
   const s = src('schema.cljs');
   const names = [...s.matchAll(/\{:name "([^"]+)"([\s\S]*?)(?=\{:name "|$)/g)]
     .filter(m => m[2].includes(':preview {:enum ["window" "region" "tail"]'))
     .map(m => m[1]).sort();
   assert(JSON.stringify(names) ===
-    JSON.stringify(['append-to-section', 'apply-ops', 'delete-lines', 'insert-lines', 'replace-lines']),
+    JSON.stringify(['append-to-section', 'apply-ops', 'delete-lines', 'insert-lines', 'replace-lines', 'replace-range']),
     `preview tools: ${names}`);
 });
-check('all five handlers forward preview', () => {
+check('all six handlers forward preview', () => {
   const c = src('core.cljs');
   const n = (c.match(/:preview \(:preview args\)/g) || []).length;
-  assert(n === 5, `preview forwarded ${n} times, expected 5`);
+  assert(n === 6, `preview forwarded ${n} times, expected 6`);
 });
 check('preview-chars is gone (no dead key)', () => {
   assert(!src('tools.cljs').includes('preview-chars'), 'preview-chars still referenced');

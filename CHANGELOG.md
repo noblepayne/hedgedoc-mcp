@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.2.3 — 2026-11-21
+
+### Added
+
+- Subtree writes: `includeSubsections` and `level` on `append-to-section` and
+  `apply-ops` `new-section-text`. A subtree append lands after the last child;
+  a subtree replace removes the children and keeps the heading line.
+- `replace-range` for multi-line line-range replacement with exact `oldText`,
+  one CAS write, dry-run and preview.
+- `writeRoundTrip: true` on a subtree read, with the echoed heading anchor.
+
+### Changed
+
+- `new-section-text` constructs one blank line after the heading, strips leading
+  and trailing blank lines from the body, and normalizes empty and
+  whitespace-only bodies. A read-then-restore is stable after one pass.
+
+### Fixed
+
+- Length-changing deletes and inserts verify on the new affected span. A
+  delete that shortened the document was reported applied-but-unconfirmed
+  despite landing.
+- A subtree replace is verified against the subtree, not the plain body up to
+  the first child.
+
 ## 0.2.2 — 2026-11-21
 
 ### Added

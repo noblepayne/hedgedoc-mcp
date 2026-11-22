@@ -92,7 +92,13 @@
    "A :line is outside 1..total-lines. Re-read and retry."
 
    "duplicate-line"
-   "The same :line appears twice in one batch. Merge the edits."})
+   "The same :line appears twice in one batch. Merge the edits."
+
+   "range-mismatch"
+   "oldText does not equal the current lines. Re-read (read-note/read-section) and rebuild oldText from the live lines, joined by LF with no trailing newline."
+
+   "range-out-of-range"
+   "startLine/endLine must be integers with 1 <= startLine <= endLine <= total lines. Re-read the note for current line numbers."})
 
 (defn hint-for [code]
   (get hint-catalog (str code)))

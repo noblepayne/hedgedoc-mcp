@@ -58,13 +58,12 @@ then `read-section` the section: marker present. Revert with another
 all four changes present. Revert as one batch.
 
 **S5: section rewrite.** `read-section <heading>` without `includeSubsections`
-and capture the body. A subtree read is not a write source: it returns
-`writeRoundTrip: false` because section writes still cover the body only, so do
-not feed that content into `new-section-text`. `apply-ops` with `heading` +
-`new-section-text` (dry-run first with `preview: "region"`, then `"tail"`; the
-last line of the replacement must appear in both, and nothing is written).
-Apply, assert the new text, then restore with `new-section-text` using the
-captured content. Restored content must equal the capture after trimming.
+and capture the body. `apply-ops` with `heading` + `new-section-text` (dry-run
+first with `preview: "region"`, then `"tail"`; the last line of the
+replacement must appear in both, and nothing is written). Apply, assert the
+new text, then restore with `new-section-text` using the captured content.
+Restored content must equal the capture after trimming. A body starting with
+`-` must keep one blank line under the heading.
 
 **S6: appended block.** `read-section <heading>` capture. `append-to-section`
 a multi-line block (a pick or a feedback quote). Assert the block landed at the
@@ -92,6 +91,18 @@ normalizing blank lines (diff non-blank lines only). Fence parity unchanged
 between your read and write (e.g. `curl` a socket op, or a second MCP). Expect
 `stale-revision`; retry once with the fresh base and succeed. If no second
 client is available, skip and say so.
+
+**S12: subtree append and replace.** `read-section <parent>` with
+`includeSubsections: true`; it must return `writeRoundTrip: true` and echo the
+anchor. Append a marker with `includeSubsections: true`; it must land after the
+last child, before the next sibling, with one blank line. Restore with
+`apply-ops` `new-section-text` + the same flags using the captured subtree;
+content equals the capture after trimming.
+
+**S13: replace-range.** Pick two adjacent lines. `replace-range` with exact
+`oldText` and a three-line `newText`; verify both markers and one extra line.
+Restore with `replace-range` over the three lines back to the original text.
+Line count and markers return to baseline.
 
 ## Report
 

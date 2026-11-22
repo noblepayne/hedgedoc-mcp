@@ -3,8 +3,11 @@
 //   npx squint compile && node test/model-subtree.mjs
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { atom, deref } from 'squint-cljs/src/squint/core.js';
 import * as base from '../hedgedoc_mcp/model.mjs';
 import * as mops from '../hedgedoc_mcp/model_ops.mjs';
+import * as tools from '../hedgedoc_mcp/tools.mjs';
+import * as st from '../hedgedoc_mcp/state.mjs';
 
 const results = [];
 function check(name, fn) {
@@ -169,7 +172,7 @@ check('~~~ is not a fence: a heading inside it terminates the subtree', () => {
 
 // ---------------------------------------------------------------- wiring contracts
 const toolsSrc = readFileSync(fileURLToPath(new URL('../src/hedgedoc_mcp/tools.cljs', import.meta.url)), 'utf8');
-check('tools/read-section adds writeRoundTrip only on the subtree branch', () => {
+check('tools/read-section adds writeRoundTrip true and the anchor only on the subtree branch', () => {
   const start = toolsSrc.indexOf('(defn read-section');
   const end = toolsSrc.indexOf(';; ---------- preview + line helpers');
   assert(start >= 0 && end > start, 'read-section not found');
@@ -180,7 +183,11 @@ check('tools/read-section adds writeRoundTrip only on the subtree branch', () =>
     'level/includeSubsections destructured out');
   assert(!bodySrc.slice(0, condAt).includes(':writeRoundTrip'),
     'writeRoundTrip must not be unconditional');
-  assert(bodySrc.slice(condAt).includes(':writeRoundTrip false'), 'subtree branch lacks writeRoundTrip false');
+  assert(bodySrc.slice(condAt).includes(':writeRoundTrip true'), 'subtree branch lacks writeRoundTrip true');
+  for (const k of [':heading heading', ':level level', ':occurrence occurrence',
+                   ':includeSubsections true']) {
+    assert(bodySrc.slice(condAt).includes(k), `subtree branch does not echo ${k}`);
+  }
   assert(bodySrc.slice(condAt).includes(':hint'), 'subtree branch lacks the hint');
 });
 
@@ -203,6 +210,165 @@ check('read-section schema declares both new arguments', () => {
     'includeSubsections schema missing');
   assert(schemaSrc.includes(':level {:type "integer" :minimum 1 :maximum 6}'),
     'level schema missing');
+});
+
+// ---------------------------------------------------------------- WO-08 write contracts
+// A show-doc parent with one child and a following sibling.
+const wdoc = base.normalize('## P\nintro\n\n### C1\nold child\n\n## S\ns body\n');
+const wsecs = mops.parse_sections(wdoc);
+const CHILD_AT = wdoc.indexOf('old child');
+
+function fakeEnv(content) {
+  const state = atom(st.make_initial('n', 3, content, 0));
+  const snap = st.snapshot_for_cas(state);
+  const boxes = { sent: [], state, snap, presence: { users: [], selections: [] } };
+  const env = {
+    state,
+    inflight: atom(null),
+    auth: null,
+    'allow-guest-writes?': false,
+    'connected?': () => true,
+    'now-ms': () => 0,
+    'sleep-ms': () => Promise.resolve(),
+    'send-op!': (...a) => { boxes.sent.push(a); return Promise.resolve({ kind: 'emitted' }); },
+    'get-presence': () => boxes.presence,
+    'max-retries': 0,
+  };
+  return { env, boxes, snap };
+}
+
+check('subtree append lands after the last child and keeps the blank line', () => {
+  const range = mops.write_range(wsecs, wdoc, 'P', { level: 2, includeSubsections: true });
+  assert(range.end === wdoc.indexOf('## S'), `range end=${range.end}`);
+  const ops = mops.append_to_section_ops(wdoc, wsecs, 'P', '+ A\n',
+    { level: 2, includeSubsections: true });
+  const out = mops.apply_ops(wdoc, ops);
+  assert(out === '## P\nintro\n\n### C1\nold child\n\n+ A\n\n## S\ns body\n',
+    `append=${JSON.stringify(out)}`);
+  assert(!out.includes('+ A\n## S'), 'append lost the blank line before the next sibling');
+});
+
+check('subtree replace removes the children and keeps the heading line', () => {
+  const ops = mops.section_replace_ops(wdoc, wsecs, 'P', 'NEW body\n',
+    { level: 2, includeSubsections: true });
+  const out = mops.apply_ops(wdoc, ops);
+  assert(out === '## P\n\nNEW body\n\n## S\ns body\n', `replace=${JSON.stringify(out)}`);
+  assert(out.startsWith('## P\n'), 'heading line was not preserved');
+  assert(!out.includes('### C1') && !out.includes('old child'), 'children survived a subtree replace');
+});
+
+check('level-qualified same-name write hits only the matching subtree', () => {
+  const dup = base.normalize('## Notes\na body\n\n### Notes\nb body\n\n## Tail\nt\n');
+  const dsecs = mops.parse_sections(dup);
+  const app = mops.apply_ops(dup, mops.append_to_section_ops(dup, dsecs, 'Notes', 'ADDED\n',
+    { level: 3, includeSubsections: true }));
+  assert(app === '## Notes\na body\n\n### Notes\nb body\n\nADDED\n\n## Tail\nt\n',
+    `level append=${JSON.stringify(app)}`);
+  const rep = mops.apply_ops(dup, mops.section_replace_ops(dup, dsecs, 'Notes', 'inner new\n',
+    { level: 3 }));
+  assert(rep === '## Notes\na body\n\n### Notes\n\ninner new\n\n## Tail\nt\n',
+    `level replace=${JSON.stringify(rep)}`);
+});
+
+check('flag-off output equals the WO-07 writer (not 0.2.2)', () => {
+  const leaf = base.normalize('## H\nbody\n\n## Next\nb\n');
+  const lsecs = mops.parse_sections(leaf);
+  const plainRep = mops.apply_ops(leaf, mops.section_replace_ops(leaf, lsecs, 'H', '- item\n', {}));
+  const flagsRep = mops.apply_ops(leaf, mops.section_replace_ops(leaf, lsecs, 'H', '- item\n',
+    { includeSubsections: false, level: 2 }));
+  assert(plainRep === '## H\n\n- item\n\n## Next\nb\n', `WO-07 shape drifted: ${JSON.stringify(plainRep)}`);
+  assert(flagsRep === plainRep, 'explicit false flag changed the leaf replace shape');
+  const plainApp = mops.apply_ops(leaf, mops.append_to_section_ops(leaf, lsecs, 'H', 'X\n', {}));
+  const flagsApp = mops.apply_ops(leaf, mops.append_to_section_ops(leaf, lsecs, 'H', 'X\n',
+    { includeSubsections: false, level: 2 }));
+  assert(plainApp === '## H\nbody\n\nX\n\n## Next\nb\n', `leaf append drifted: ${JSON.stringify(plainApp)}`);
+  assert(flagsApp === plainApp, 'explicit false flag changed the leaf append shape');
+  assert(plainRep !== '## H\n- item\n\n## Next\nb\n', 'leaf replace regressed to the 0.2.2 flush body');
+});
+
+check('read-section echoes the write anchor and keeps the default shape', () => {
+  const { env } = fakeEnv(wdoc);
+  const sub = tools.read_section(env, { heading: 'P', level: 2, occurrence: 0, includeSubsections: true });
+  assert(sub.writeRoundTrip === true, `writeRoundTrip=${sub.writeRoundTrip}`);
+  assert(sub.heading === 'P' && sub.level === 2 && sub.occurrence === 0
+    && sub.includeSubsections === true, `anchor=${JSON.stringify(sub)}`);
+  assert(typeof sub.hint === 'string' && sub.hint.length > 0, 'no subtree hint');
+  assert(sub.start === 5 && sub.content.includes('### C1'), 'subtree slice changed');
+  const plain = tools.read_section(env, { heading: 'P', level: 2 });
+  assert(JSON.stringify(Object.keys(plain).sort()) === JSON.stringify(['content', 'end', 'hash', 'rev', 'start']),
+    `default read keys=${Object.keys(plain)}`);
+  assert(plain.writeRoundTrip === undefined, 'writeRoundTrip leaked into a default read');
+});
+
+check('subtree append dry-run writes nothing and keeps the resolved range', () => {
+  const { env, boxes, snap } = fakeEnv(wdoc);
+  let d = null;
+  try {
+    tools.append_to_section(env, { heading: 'P', text: '+ A\n',
+      'base-rev': snap.rev, 'base-hash': snap.hash,
+      dryRun: true, includeSubsections: true, level: 2, preview: 'region' });
+  } catch (e) { d = errData(e); }
+  assert(d && d.code === 'dry-run-preview', `dry-run code=${d && d.code}`);
+  assert(d.written === false, 'dry-run did not report written false');
+  assert(d['new-rev'] === undefined, 'dry-run set new-rev');
+  assert(boxes.sent.length === 0, `dry-run emitted ${boxes.sent.length} op(s)`);
+  assert(deref(boxes.state).rev === snap.rev, 'dry-run moved the revision');
+  assert(d.ops[0][0] === 'retain' && d.ops[0][1] === wdoc.indexOf('## S'),
+    `append did not start from the subtree end: ${JSON.stringify(d.ops[0])}`);
+  assert(String(d.preview).includes('+ A'), `region preview missed the block: ${JSON.stringify(d.preview)}`);
+});
+
+check('subtree append target feeds overlap-check (child selection aborts)', () => {
+  const { env, boxes, snap } = fakeEnv(wdoc);
+  boxes.presence = { users: [], selections: [{ rev: snap.rev, start: CHILD_AT, end: CHILD_AT + 9 }] };
+  let code = null;
+  try {
+    tools.append_to_section(env, { heading: 'P', text: '+ A\n',
+      'base-rev': snap.rev, 'base-hash': snap.hash,
+      includeSubsections: true, level: 2 });
+  } catch (e) { code = errData(e).code; }
+  assert(code === 'overlap-abort', `child selection did not abort: ${code}`);
+  assert(boxes.sent.length === 0, 'overlap-abort still emitted');
+});
+
+check('handlers forward the flags and reject raw ops + flags', () => {
+  const coreSrc2 = readFileSync(fileURLToPath(new URL('../src/hedgedoc_mcp/core.cljs', import.meta.url)), 'utf8');
+  const a0 = coreSrc2.indexOf('(defn- handle-apply-ops');
+  const a1 = coreSrc2.indexOf('(defn- handle-append-to-section');
+  const a2 = coreSrc2.indexOf('(defn- handle-set-note');
+  assert(a0 >= 0 && a1 > a0 && a2 > a1, 'handlers not found');
+  const applyH = coreSrc2.slice(a0, a1);
+  const appendH = coreSrc2.slice(a1, a2);
+  assert(applyH.includes('has-subtree-flag?')
+    && applyH.includes('(contains? args :includeSubsections)')
+    && applyH.includes('(contains? args :level)'), 'raw ops + flags not detected');
+  assert(/\(when \(and has-ops\? has-subtree-flag\?\)[\s\S]*?:bad-args/.test(applyH),
+    'raw ops + flags not rejected as bad-args');
+  for (const h of [applyH, appendH]) {
+    assert(h.includes(':includeSubsections (true? (:includeSubsections args))'),
+      'includeSubsections not forwarded');
+    assert(h.includes(':level (checked-level args)'), 'level not forwarded via checked-level');
+  }
+});
+
+check('schema advertises subtree flags and drops the read-only claim', () => {
+  const blockOf = (name) => {
+    const i = schemaSrc.indexOf(`{:name "${name}"`);
+    const j = schemaSrc.indexOf('{:name "', i + 1);
+    assert(i >= 0, `schema ${name} missing`);
+    return schemaSrc.slice(i, j < 0 ? schemaSrc.length : j);
+  };
+  for (const name of ['apply-ops', 'append-to-section']) {
+    const b = blockOf(name);
+    assert(b.includes(':includeSubsections {:type "boolean" :default false}'),
+      `${name} lacks includeSubsections`);
+    assert(b.includes(':level {:type "integer" :minimum 1 :maximum 6}'), `${name} lacks level 1..6`);
+  }
+  const read = blockOf('read-section');
+  assert(read.includes('writeRoundTrip true'), 'read-section still says writeRoundTrip false');
+  assert(!read.includes('writeRoundTrip false'), 'stale writeRoundTrip false description');
+  assert(!blockOf('apply-ops').includes('BODY only'), 'stale BODY-only description');
+  assert(blockOf('append-to-section').includes('includeSubsections true'), 'append description not updated');
 });
 
 const failed = results.filter(([, r]) => r === 'FAIL');
