@@ -10,7 +10,7 @@
                                         :default 0}}
                   :additionalProperties false}}
    {:name "read-section"
-    :description "Scoped read of one section by heading (case/space-insensitive anchor; :occurrence selects among duplicates; :level 1..6 filters to that heading level with no fallback). includeSubsections reads from after the heading line to the next heading at or above that level and returns writeRoundTrip true plus the echoed anchor (heading, level, occurrence, includeSubsections) so the slice can be written back: pass includeSubsections true to apply-ops with new-section-text, or to append-to-section. The heading line is always preserved. Returns rev, hash, content slice, UTF-16 offsets. Read-only."
+    :description "Scoped read of one section by heading (case/space-insensitive anchor; :occurrence selects among duplicates; :level 1..6 filters to that heading level with no fallback). includeSubsections reads from after the heading line to the next heading at or above that level and returns writeRoundTrip true plus the echoed fields (heading, level, occurrence, includeSubsections; no nested anchor object) so the slice can be written back: pass includeSubsections true to apply-ops with new-section-text, or to append-to-section. The heading line is always preserved. Returns rev, hash, content slice, UTF-16 offsets. Read-only."
     :inputSchema {:type "object"
                   :properties {:heading {:type "string"}
                                :occurrence {:type "integer" :minimum 0}

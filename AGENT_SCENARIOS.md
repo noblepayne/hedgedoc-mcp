@@ -93,8 +93,8 @@ between your read and write (e.g. `curl` a socket op, or a second MCP). Expect
 client is available, skip and say so.
 
 **S12: subtree append and replace.** `read-section <parent>` with
-`includeSubsections: true`; it must return `writeRoundTrip: true` and echo the
-anchor. Append a marker with `includeSubsections: true`; it must land after the
+`includeSubsections: true`; it must return `writeRoundTrip: true` and echo
+`heading`, `level`, `occurrence`, and `includeSubsections`. Append a marker with `includeSubsections: true`; it must land after the
 last child, before the next sibling, with one blank line. Restore with
 `apply-ops` `new-section-text` + the same flags using the captured subtree;
 content equals the capture after trimming.

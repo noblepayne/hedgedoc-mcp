@@ -294,7 +294,7 @@ decide; a blind re-emit can duplicate the edit.
 |---|---|---|
 | `note-id` | Every tool except `list-notes`, in the multi-note binary | Selects the worker. The single-note `core.mjs` rejects it. |
 | `waitMs` | `get-status` | Integer 0..15000, default 0. Waits up to that many ms for boot to land, then returns the status with `waitedMs`. Costs wall-clock time on the call. |
-| `level`, `includeSubsections` | `read-section`, `apply-ops`, `append-to-section` | `level` is 1..6 and filters without a fallback. `includeSubsections: true` reads or writes from after the heading line to the next heading at or above that level, or to the document end. A subtree read returns `writeRoundTrip: true` and echoes the anchor. Raw ops plus either flag is `bad-args`. |
+| `level`, `includeSubsections` | `read-section`, `apply-ops`, `append-to-section` | `level` is 1..6 and filters without a fallback. `includeSubsections: true` reads or writes from after the heading line to the next heading at or above that level, or to the document end. A subtree read returns `writeRoundTrip: true` and echoes `heading`, `level`, `occurrence`, and `includeSubsections`; there is no nested anchor object. Raw ops plus either flag is `bad-args`. |
 | `sections` | `read-note` | `"all"` (default), `"none"`, or `"window"` for headings inside the returned slice. A boolean is rejected with a hint to use `"none"`. `get-status` still returns every heading. |
 | `base-rev`, `base-hash` | Every write | Taken from a fresh read. A stale base is refused. |
 | `startLine`, `endLine`, `oldText`, `newText` | `replace-range` | Inclusive 1-based range. `oldText` is the lines joined by `\n`, no trailing newline. `newText` may be multi-line; blank deletes the range. |
